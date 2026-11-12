@@ -256,7 +256,7 @@ def get_muon_weight_dimension_numbers(model, config=None, verbose=False):
 
   def apply_transform_nnx(path: Tuple[jax.tree_util.KeyEntry, ...], variable):
     # Convert jax.tree_util.KeyEntry path to Tuple[str, ...]
-    path_strings = tuple(p.key for p in path if isinstance(p, jax.tree_util.DictKey))
+    path_strings = tuple(str(p.key) for p in path if isinstance(p, jax.tree_util.DictKey))
     val_shape = getattr(variable.get_value(), "shape", None)
     dim_num = transform_logic(path_strings, shape=val_shape, include_routers=include_routers)
     return to_stacked_layout(dim_num, len(val_shape or ()), get_scan_axes(variable))
