@@ -1877,6 +1877,12 @@ class MoEGeneral(BaseModel):
       description="Whether to pre-fuse MoE weights (w0 and w1) during initialization. "
       "This enables a single FFN1 grouped GEMM in sparse MoE paths and passes fused weights directly in vllm_rpa mode.",
   )
+  moe_unsliced_prefused_wi: bool = Field(
+      False,
+      description="When True (with prefuse_moe_weights=True and sparse_matmul=True), pass the fused wi [E, emb, 2*mlp] "
+      "across shard_map as a single operand (w1_kernel=None) instead of slicing into w0/w1 and re-concatenating "
+      "inside gmm_up. Requires the MLP dim of wi to be unsharded (tensor parallelism = 1).",
+  )
   fuse_expert_scales: bool = Field(
       False,
       description="Whether to fuse the expert scaling factors into the expert weights. "
@@ -7124,6 +7130,19 @@ class MaxTextConfig(
       self.validate_moe_dropless_fallback()
       self.validate_moe_log_max_load_ratio()
       self.validate_moe_tc_ragged_sort()
+    if self.moe_unsliced_prefused_wi:
+      unmet = [
+          requirement
+          for requirement, ok in (
+              ("prefuse_moe_weights=True", self.prefuse_moe_weights),
+              ("sparse_matmul=True", self.sparse_matmul),
+              ("num_moe_emb_chunks=0", self.num_moe_emb_chunks == 0),
+              ("moe_fsdp_use_two_stage_all_gather=False", not self.moe_fsdp_use_two_stage_all_gather),
+          )
+          if not ok
+      ]
+      if unmet:
+        raise ValueError(f"moe_unsliced_prefused_wi=True requires {', '.join(unmet)}.")
     self.validate_num_moe_emb_chunks()
     self.validate_moe_quantize_token_all_gather()
     self.validate_moe_topk_before_ep_all_gather()
