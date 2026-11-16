@@ -64,6 +64,7 @@ def call_pipeline(config, pipeline, prompt, negative_prompt, num_inference_steps
 # `maxtext.m3.diffuser_pipelines`, imported on demand. Register new models here.
 MODEL_NAME_TO_PIPELINE = {
     "wan2.1": "wan_pipeline.WanPipeline2_1",
+    # Wan 2.2 T2V uses the same pipeline; only the VAE config (residual, patchified, read from the checkpoint) differs.
     "wan2.2": "wan_pipeline.WanPipeline2_1",
 }
 
