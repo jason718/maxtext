@@ -623,6 +623,145 @@ def _compute_qsa_doc_start(segment_ids: jax.Array) -> jax.Array:
   return jnp.zeros((b, s), dtype=jnp.int32).at[jnp.arange(b, dtype=jnp.int32)[:, None], sorted_pos].set(sorted_doc_start)
 
 
+def tiled_qsa_top_k(
+    q_rot: jax.Array,
+    block_keys: jax.Array,
+    block_valid: jax.Array,
+    block_seg_ids: jax.Array,
+    group_starts: jax.Array,
+    segment_ids: jax.Array,
+    *,
+    compress_ratio: int,
+    index_head_dim: int,
+    k_top: int,
+    block_chunk_size: int,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes exact top-k QSA block scores and global block indices by scanning key-block chunks."""
+  b, s, h, _ = q_rot.shape
+  num_blocks = block_keys.shape[1]
+  mc = block_chunk_size
+  num_chunks = (num_blocks + mc - 1) // mc
+  m_pad = num_chunks * mc
+  pad_m = m_pad - num_blocks
+
+  bk_pad, bv_pad, bseg_pad, gstart_pad = block_keys, block_valid, block_seg_ids, group_starts
+  if pad_m > 0:
+    bk_pad = jnp.pad(bk_pad, ((0, 0), (0, pad_m), (0, 0)))
+    bv_pad = jnp.pad(bv_pad, ((0, 0), (0, pad_m)), constant_values=False)
+    bseg_pad = jnp.pad(bseg_pad, ((0, 0), (0, pad_m)), constant_values=0)
+    gstart_pad = jnp.pad(gstart_pad, ((0, 0), (0, pad_m)), constant_values=0)
+
+  bk_chunks = bk_pad.reshape(b, num_chunks, mc, index_head_dim).transpose(1, 0, 2, 3)
+  bv_chunks = bv_pad.reshape(b, num_chunks, mc).transpose(1, 0, 2)
+  bseg_chunks = bseg_pad.reshape(b, num_chunks, mc).transpose(1, 0, 2)
+  gend_chunks = (gstart_pad + (compress_ratio - 1)).reshape(b, num_chunks, mc).transpose(1, 0, 2)
+
+  q_dtype = q_rot.dtype
+  bk_dtype = bk_chunks.dtype
+  q_sharding = getattr(jax.typeof(q_rot), "sharding", None)
+  bk_sharding = getattr(jax.typeof(bk_chunks), "sharding", None)
+  mesh = jax.sharding.get_abstract_mesh()
+  is_explicit = not mesh.empty and any(t == jax.sharding.AxisType.Explicit for t in mesh.axis_types)
+
+  def _impl(
+      q_in: jax.Array,
+      bk_in: jax.Array,
+      bv_in: jax.Array,
+      bseg_in: jax.Array,
+      gend_in: jax.Array,
+      seg_in: jax.Array,
+  ) -> tuple[jax.Array, jax.Array]:
+    # Shard-local zero barriers keep scan-invariant masks tied to dynamic (q_in, bk_in) so
+    # outer jax.checkpoint partial_eval cannot hoist [num_chunks, B, S, mc] tensors out of scan.
+    unk_zero_bs = jax.lax.optimization_barrier(jnp.sum(q_in[:, :, :1, :1].astype(jnp.int32) * 0, axis=(2, 3)))
+    unk_zero_b = jax.lax.optimization_barrier(jnp.sum(bk_in[:1, :, :1, :1].astype(jnp.int32) * 0, axis=(0, 2, 3)))
+
+    sqrt_d = jnp.sqrt(float(index_head_dim))
+    q_pos = (jnp.arange(s, dtype=jnp.int32)[None, :] + unk_zero_bs)[:, :, None]
+    seg_q = (seg_in + unk_zero_bs)[:, :, None]
+    q_nonpad = seg_q != 0
+    bv_dyn = bv_in & (unk_zero_b[None, :, None] == 0)
+    bseg_dyn = bseg_in + unk_zero_b[None, :, None]
+    gend_dyn = gend_in + unk_zero_b[None, :, None]
+    in_bounds_chunks = (jnp.arange(m_pad, dtype=jnp.int32) < num_blocks).reshape(num_chunks, mc)
+    in_b_dyn = in_bounds_chunks[:, None, :] & (unk_zero_b[None, :, None] == 0)
+    chunk_starts = (jnp.arange(num_chunks, dtype=jnp.int32) * mc)[:, None] + unk_zero_b[None, :]
+
+    zero_bs1 = unk_zero_bs[:, :, None]
+    init_vals = jnp.broadcast_to(zero_bs1.astype(jnp.float32) + jnp.float32(-jnp.inf), (b, s, k_top))
+    init_idx = jnp.broadcast_to(zero_bs1, (b, s, k_top))
+
+    def _scan_body(
+        carry: tuple[jax.Array, jax.Array],
+        xs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[tuple[jax.Array, jax.Array], None]:
+      run_vals, run_idx = carry
+      bk_c, bv_c, bseg_c, gend_c, in_b_c, chunk_start = xs
+
+      raw_scores = jnp.einsum("bthd,bmd->bthm", q_in.astype(jnp.float32), bk_c.astype(jnp.float32))
+      scores = jnp.sum(jax.nn.relu(raw_scores), axis=2) / sqrt_d
+      chunk_valid = bv_c[:, None, :] & (bseg_c[:, None, :] == seg_q) & (gend_c[:, None, :] <= q_pos) & q_nonpad
+      masked_fill = jnp.where(in_b_c[:, None, :], jnp.float32(-1e9), jnp.float32(-jnp.inf))
+      chunk_scores = jnp.where(chunk_valid, scores, masked_fill)
+
+      # Placing run_vals before chunk_scores keeps input positions ordered by global block index,
+      # so stable lax.top_k breaks score ties identically to dense top_k over all M blocks.
+      cand_vals = jnp.concatenate([run_vals, chunk_scores], axis=-1)
+      next_vals, pick = jax.lax.top_k(cand_vals, k_top)
+      from_run = pick < k_top
+      picked_run_idx = jnp.take_along_axis(run_idx, jnp.where(from_run, pick, 0), axis=-1)
+      next_idx = jnp.where(from_run, picked_run_idx, chunk_start[:, None, None] + (pick - k_top))
+      return (next_vals, next_idx), None
+
+    (top_vals, top_indices), _ = jax.lax.scan(
+        _scan_body,
+        (init_vals, init_idx),
+        (bk_in, bv_dyn, bseg_dyn, gend_dyn, in_b_dyn, chunk_starts),
+    )
+    return top_vals, top_indices
+
+  @jax.custom_vjp
+  def _kernel(
+      q_in: jax.Array,
+      bk_in: jax.Array,
+      bv_in: jax.Array,
+      bseg_in: jax.Array,
+      gend_in: jax.Array,
+      seg_in: jax.Array,
+  ) -> tuple[jax.Array, jax.Array]:
+    return _impl(q_in, bk_in, bv_in, bseg_in, gend_in, seg_in)
+
+  def _fwd(
+      q_in: jax.Array,
+      bk_in: jax.Array,
+      bv_in: jax.Array,
+      bseg_in: jax.Array,
+      gend_in: jax.Array,
+      seg_in: jax.Array,
+  ) -> tuple[tuple[jax.Array, jax.Array], tuple[()]]:
+    # Outputs feed only non-differentiable int32 block selection; save zero scan residuals.
+    return _impl(q_in, bk_in, bv_in, bseg_in, gend_in, seg_in), ()
+
+  def _bwd(
+      _res: tuple[()],
+      _g: tuple[jax.Array, jax.Array],
+  ) -> tuple[jax.Array, jax.Array, None, None, None, None]:
+    dq = (
+        jnp.zeros((b, s, h, index_head_dim), dtype=q_dtype, out_sharding=q_sharding)
+        if is_explicit and q_sharding is not None
+        else jnp.zeros((b, s, h, index_head_dim), dtype=q_dtype)
+    )
+    dbk = (
+        jnp.zeros((num_chunks, b, mc, index_head_dim), dtype=bk_dtype, out_sharding=bk_sharding)
+        if is_explicit and bk_sharding is not None
+        else jnp.zeros((num_chunks, b, mc, index_head_dim), dtype=bk_dtype)
+    )
+    return dq, dbk, None, None, None, None
+
+  _kernel.defvjp(_fwd, _bwd)
+  return _kernel(q_rot, bk_chunks, bv_chunks, bseg_chunks, gend_chunks, segment_ids)
+
+
 class Qwen3_8QSAIndexer(nnx.Module):
   """MQA micro-block indexer selecting top-k complete blocks for QSA."""
 
@@ -639,6 +778,7 @@ class Qwen3_8QSAIndexer(nnx.Module):
       weight_dtype: Any = jnp.bfloat16,
       *,
       mask_mode: str = "gather",
+      block_chunk_size: int | None = None,
       rngs: nnx.Rngs,
   ):
     if index_kv_heads != 1:
@@ -650,10 +790,13 @@ class Qwen3_8QSAIndexer(nnx.Module):
       )
     if mask_mode not in ("gather", "reshape"):
       raise ValueError(f"Expected mask_mode in ('gather', 'reshape'), got {mask_mode!r}.")
+    if block_chunk_size is not None and block_chunk_size <= 0:
+      raise ValueError(f"Expected block_chunk_size > 0 or None, got {block_chunk_size}.")
     self.index_head_dim, self.index_n_heads = index_head_dim, index_n_heads
     self.token_budget = token_budget
     self.compress_ratio, self.block_topk = compress_ratio, token_budget // compress_ratio
     self.mask_mode = mask_mode
+    self.block_chunk_size = block_chunk_size
 
     kw = {"use_bias": False, "dtype": dtype, "param_dtype": weight_dtype, "rngs": rngs}
     self.index_qk_proj = nnx.Linear(emb_dim, (index_n_heads + index_kv_heads) * index_head_dim, **kw)
@@ -667,6 +810,7 @@ class Qwen3_8QSAIndexer(nnx.Module):
       attention_mask: jax.Array | None = None,
       segment_ids: jax.Array | None = None,
       return_token_mask: bool = True,
+      block_chunk_size: int | None = None,
   ) -> tuple[jax.Array | None, jax.Array]:
     """Computes sparse token mask (B, 1, S, S) and document-local block indices (B, S, topk).
 
@@ -677,12 +821,15 @@ class Qwen3_8QSAIndexer(nnx.Module):
       segment_ids: Optional (B, S) 1-indexed document IDs (0 = padding); when both are given, padding from
         attention_mask is folded into segment_ids.
       return_token_mask: Whether to construct and return the (B, 1, S, S) boolean token mask.
+      block_chunk_size: Optional key-block chunk size for tiled top-k when return_token_mask is False.
 
     Returns:
       Tuple of (token_mask_or_none, selected_block_indices).
     """
     if attention_mask is not None and attention_mask.ndim != 2:
       raise ValueError(f"Expected 2D (B, S) attention_mask or None, got shape {attention_mask.shape}.")
+    if block_chunk_size is not None and block_chunk_size <= 0:
+      raise ValueError(f"Expected block_chunk_size > 0 or None, got {block_chunk_size}.")
 
     b, s, _ = hidden_states.shape
     c = self.compress_ratio
@@ -726,18 +873,38 @@ class Qwen3_8QSAIndexer(nnx.Module):
     assert isinstance(res, jax.Array)
     block_keys = res.squeeze(2)
 
-    raw_scores = jnp.einsum("bthd,bmd->bthm", q_rot.astype(jnp.float32), block_keys.astype(jnp.float32))
-    scores = jnp.sum(jax.nn.relu(raw_scores), axis=2) / jnp.sqrt(float(self.index_head_dim))
-
-    valid_q_block = (
-        block_valid[:, None, :]
-        & (block_seg_ids[:, None, :] == segment_ids[:, :, None])
-        & ((group_starts + c - 1)[:, None, :] <= jnp.arange(s)[None, :, None])
-        & (segment_ids[:, :, None] != 0)
-    )
-
     k_top = min(self.block_topk, num_blocks)
-    top_vals, top_indices = jax.lax.top_k(jnp.where(valid_q_block, scores, -1e9), k_top)
+    eff_chunk = None
+    if not return_token_mask:
+      eff_chunk = block_chunk_size if block_chunk_size is not None else self.block_chunk_size
+      if eff_chunk is None:
+        eff_chunk = min(512, self.block_topk)
+
+    if eff_chunk is not None and num_blocks > eff_chunk:
+      top_vals, top_indices = tiled_qsa_top_k(
+          q_rot,
+          block_keys,
+          block_valid,
+          block_seg_ids,
+          group_starts,
+          segment_ids,
+          compress_ratio=c,
+          index_head_dim=self.index_head_dim,
+          k_top=k_top,
+          block_chunk_size=eff_chunk,
+      )
+    else:
+      raw_scores = jnp.einsum("bthd,bmd->bthm", q_rot.astype(jnp.float32), block_keys.astype(jnp.float32))
+      scores = jnp.sum(jax.nn.relu(raw_scores), axis=2) / jnp.sqrt(float(self.index_head_dim))
+
+      valid_q_block = (
+          block_valid[:, None, :]
+          & (block_seg_ids[:, None, :] == segment_ids[:, :, None])
+          & ((group_starts + c - 1)[:, None, :] <= jnp.arange(s)[None, :, None])
+          & (segment_ids[:, :, None] != 0)
+      )
+
+      top_vals, top_indices = jax.lax.top_k(jnp.where(valid_q_block, scores, -1e9), k_top)
     doc_local_idx = (jnp.take_along_axis(group_starts[:, None, :], top_indices, axis=2) - doc_start[:, :, None]) // c
     selected_block_indices = jnp.where(top_vals > -1e8, doc_local_idx, -1).astype(jnp.int32)
     if self.block_topk > k_top:

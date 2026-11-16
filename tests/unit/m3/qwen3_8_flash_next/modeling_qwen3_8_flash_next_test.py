@@ -26,6 +26,7 @@ Sections:
 """
 
 import functools
+import re
 import types
 from typing import Any
 import unittest
@@ -1593,6 +1594,580 @@ class Qwen3_8QSAAttentionTest(absltest.TestCase):
       )
       self.assertIn("f32[4,1,16,1,2,32]", tsp_hlo)
       self.assertNotIn("f32[4,1,16,2,2,32]", tsp_hlo)
+
+  def test_qsa_tiled_indexer_parity_ties_padding_boundary_and_remat(self):
+    """Verifies bit-exact tiled QSA indexer parity, ties, HLO tiling, boundary negative control, and remat."""
+    rng = np.random.default_rng(1409)
+    with self.assertRaises(ValueError):
+      modeling_qwen3_8_flash_next.Qwen3_8QSAIndexer(block_chunk_size=0, rngs=nnx.Rngs(0))
+    with self.assertRaises(ValueError):
+      modeling_qwen3_8_flash_next.Qwen3_8QSAIndexer(block_chunk_size=-4, rngs=nnx.Rngs(0))
+
+    emb_dim, h_idx, d_idx, c = 64, 4, 32, 4
+    rope = modeling_qwen3_8_flash_next.Qwen3_8RotaryEmbedding(
+        head_dim=64, partial_rotary_factor=0.5, rope_theta=10000.0, mrope_section=(6, 5, 5)
+    )
+
+    # 1. Bit-exact parity (values + order) across unpacked, chunk sizes (incl. mc < k_top, mc=1, non-divisible),
+    #    both float32 and bfloat16, eager and jit, with B > 1.
+    for dt in (jnp.float32, jnp.bfloat16):
+      idx = modeling_qwen3_8_flash_next.Qwen3_8QSAIndexer(
+          emb_dim=emb_dim,
+          index_n_heads=h_idx,
+          index_kv_heads=1,
+          index_head_dim=d_idx,
+          token_budget=16,
+          compress_ratio=c,
+          dtype=dt,
+          weight_dtype=dt,
+          rngs=nnx.Rngs(11),
+      )
+      with self.assertRaises(ValueError):
+        x0 = jnp.zeros((1, 8, emb_dim), dtype=dt)
+        cos0, sin0 = rope(x0, jnp.arange(8, dtype=jnp.int32)[None, :])
+        idx(x0, (cos0, sin0), return_token_mask=False, block_chunk_size=0)
+
+      b, s = 2, 80  # M = 20 != d_idx // 2 (16), breaking RoPE half-dim symmetry.
+      x = jnp.array(rng.standard_normal((b, s, emb_dim)), dtype=dt)
+      pos = jnp.tile(jnp.arange(s, dtype=jnp.int32), (b, 1))
+      cos, sin = rope(x, pos)
+      _, blk_dense = idx(x, (cos, sin), return_token_mask=True)
+      for mc in (None, 1, 3, 4, 7):
+        tmask_f, blk_tiled = jax.jit(
+            lambda xi, ci, si, mod_i=idx, mc_i=mc: mod_i(xi, (ci, si), return_token_mask=False, block_chunk_size=mc_i)
+        )(x, cos, sin)
+        self.assertIsNone(tmask_f)
+        np.testing.assert_array_equal(np.asarray(blk_tiled), np.asarray(blk_dense))
+
+    # 2. Packed multi-doc with left/middle/right padding + combined attention_mask & segment_ids.
+    idx_f32 = modeling_qwen3_8_flash_next.Qwen3_8QSAIndexer(
+        emb_dim=emb_dim,
+        index_n_heads=h_idx,
+        index_kv_heads=1,
+        index_head_dim=d_idx,
+        token_budget=16,
+        compress_ratio=c,
+        dtype=jnp.float32,
+        weight_dtype=jnp.float32,
+        rngs=nnx.Rngs(17),
+    )
+    b, s = 2, 80
+    x = jnp.array(rng.standard_normal((b, s, emb_dim)), dtype=jnp.float32)
+    pos = jnp.tile(jnp.arange(s, dtype=jnp.int32), (b, 1))
+    cos, sin = rope(x, pos)
+    seg = jnp.ones((b, s), dtype=jnp.int32)
+    seg = seg.at[0, 18:38].set(2).at[0, 38:44].set(0).at[0, 44:].set(3).at[1, :5].set(0).at[1, 31:].set(2)
+    amask = jnp.ones((b, s), dtype=jnp.int32).at[0, 72:].set(0).at[1, 27:31].set(0)
+    for m_in, s_in in ((amask, None), (None, seg), (amask, seg)):
+      _, blk_d = idx_f32(x, (cos, sin), attention_mask=m_in, segment_ids=s_in, return_token_mask=True)
+      _, blk_t = idx_f32(
+          x, (cos, sin), attention_mask=m_in, segment_ids=s_in, return_token_mask=False, block_chunk_size=3
+      )
+      np.testing.assert_array_equal(np.asarray(blk_t), np.asarray(blk_d))
+
+    # 3. Forced-tie inputs: all-zero scores (0.0 ties), negative pre-ReLU scores (0.0 ties),
+    #    duplicated blocks across chunk boundaries (non-zero exact ties), and masked -1e9 ties.
+    x_zero = jnp.zeros((b, s, emb_dim), dtype=jnp.float32)
+    _, blk_zero_d = idx_f32(x_zero, (cos, sin), segment_ids=seg, return_token_mask=True)
+    _, blk_zero_t = idx_f32(x_zero, (cos, sin), segment_ids=seg, return_token_mask=False, block_chunk_size=3)
+    np.testing.assert_array_equal(np.asarray(blk_zero_t), np.asarray(blk_zero_d))
+
+    m_tie = s // c
+    q_tie = jnp.ones((b, s, h_idx, d_idx), dtype=jnp.float32)
+    bk_neg = -jnp.ones((b, m_tie, d_idx), dtype=jnp.float32)
+    bv_all = jnp.ones((b, m_tie), dtype=bool)
+    gs_all = jnp.broadcast_to(jnp.arange(m_tie, dtype=jnp.int32)[None, :] * c, (b, m_tie))
+    seg_all = jnp.ones((b, s), dtype=jnp.int32)
+    bseg_all = jnp.ones((b, m_tie), dtype=jnp.int32)
+    bk_dyadic = jnp.broadcast_to(
+        jnp.array([0.5, 1.25], dtype=jnp.float32)[None, None, :, None], (b, m_tie // 2, 2, d_idx)
+    ).reshape(b, m_tie, d_idx)
+    bk_dup = jnp.broadcast_to(
+        jnp.array(rng.standard_normal((b, 1, 2, d_idx)), dtype=jnp.float32), (b, m_tie // 2, 2, d_idx)
+    ).reshape(b, m_tie, d_idx)
+    for exact_vals, bk_case in ((True, bk_neg), (True, bk_dyadic), (False, bk_dup)):
+      raw_ref = jnp.einsum("bthd,bmd->bthm", q_tie, bk_case)
+      sc_ref = jnp.sum(jax.nn.relu(raw_ref), axis=2) / jnp.sqrt(float(d_idx))
+      valid_ref = (gs_all + c - 1)[:, None, :] <= jnp.arange(s)[None, :, None]
+      dv, di = jax.lax.top_k(jnp.where(valid_ref, sc_ref, -1e9), 5)
+      tv, ti = modeling_qwen3_8_flash_next.tiled_qsa_top_k(
+          q_tie,
+          bk_case,
+          bv_all,
+          bseg_all,
+          gs_all,
+          seg_all,
+          compress_ratio=c,
+          index_head_dim=d_idx,
+          k_top=5,
+          block_chunk_size=3,
+      )
+      if exact_vals:
+        np.testing.assert_array_equal(np.asarray(tv), np.asarray(dv))
+      else:
+        np.testing.assert_allclose(np.asarray(tv), np.asarray(dv), rtol=1e-6, atol=1e-6)
+      np.testing.assert_array_equal(np.asarray(ti), np.asarray(di))
+
+    # 4. Short sequences (S < token_budget with block_topk > num_blocks -1 fill, and S < c) and S % c != 0.
+    for s_case, mc_case in ((12, None), (12, 2), (3, None), (3, 1), (70, None), (70, 4), (70, 5)):
+      x_c = jnp.array(rng.standard_normal((b, s_case, emb_dim)), dtype=jnp.float32)
+      pos_c = jnp.tile(jnp.arange(s_case, dtype=jnp.int32), (b, 1))
+      cos_c, sin_c = rope(x_c, pos_c)
+      _, blk_cd = idx_f32(x_c, (cos_c, sin_c), return_token_mask=True)
+      _, blk_ct = idx_f32(x_c, (cos_c, sin_c), return_token_mask=False, block_chunk_size=mc_case)
+      self.assertEqual(blk_ct.shape, (b, s_case, idx_f32.block_topk))
+      np.testing.assert_array_equal(np.asarray(blk_ct), np.asarray(blk_cd))
+
+    # 5. Compiled HLO: return_token_mask=False must NEVER materialize full f32[B,S,H,M] / f32[B,S,M]
+    #    (positive control: return_token_mask=True DOES materialize f32[B,S,H,M]).
+    gd_i, p_i, rest_i = nnx.split(idx_f32, nnx.Param, ...)
+    hlo_tiled = (
+        jax.jit(lambda pp, xi, ci, si: nnx.merge(gd_i, pp, rest_i)(xi, (ci, si), return_token_mask=False)[1])
+        .lower(p_i, x, cos, sin)
+        .compile()
+        .as_text()
+    )
+    hlo_dense = (
+        jax.jit(lambda pp, xi, ci, si: nnx.merge(gd_i, pp, rest_i)(xi, (ci, si), return_token_mask=True)[1])
+        .lower(p_i, x, cos, sin)
+        .compile()
+        .as_text()
+    )
+    self.assertIn("f32[2,80,4,20]", hlo_dense)
+    self.assertNotIn("f32[2,80,4,20]", hlo_tiled)
+    self.assertNotIn("f32[2,80,20]", hlo_tiled)
+    self.assertIn("f32[2,80,4,4]", hlo_tiled)
+
+    # 6. Negative control: boundary-crossing winner in partial tail chunk (M=17, mc=4 -> block 16 in chunk 4)
+    #    and chunk-1 boundary (block 4). Dropping the tail chunk must fail parity.
+    s_nc, m_nc, mc_nc = 70, 17, 4
+    q_nc = jnp.zeros((b, s_nc, h_idx, d_idx), dtype=jnp.float32).at[:, :, :, 0].set(1.0)
+    bk_nc = jnp.full((b, m_nc, d_idx), 0.1, dtype=jnp.float32)
+    bk_nc = bk_nc.at[:, 4, 0].set(5.0).at[:, 16, 0].set(9.0)
+    bv_nc = jnp.ones((b, m_nc), dtype=bool)
+    gs_nc = jnp.broadcast_to(jnp.arange(m_nc, dtype=jnp.int32)[None, :] * c, (b, m_nc))
+    seg_nc = jnp.ones((b, s_nc), dtype=jnp.int32)
+    bseg_nc = jnp.ones((b, m_nc), dtype=jnp.int32)
+    _, ti_ok = modeling_qwen3_8_flash_next.tiled_qsa_top_k(
+        q_nc,
+        bk_nc,
+        bv_nc,
+        bseg_nc,
+        gs_nc,
+        seg_nc,
+        compress_ratio=c,
+        index_head_dim=d_idx,
+        k_top=4,
+        block_chunk_size=mc_nc,
+    )
+    # Query s_nc-1 (=69) sees block 16 (end token 67 <= 69) as top-1 and block 4 as top-2.
+    np.testing.assert_array_equal(np.asarray(ti_ok[:, -1, :2]), np.array([[16, 4], [16, 4]], dtype=np.int32))
+    # Simulate dropping the tail chunk (m >= 16): block 16 vanishes from top-k.
+    bv_drop_tail = bv_nc.at[:, 16:].set(False)
+    _, ti_dropped = modeling_qwen3_8_flash_next.tiled_qsa_top_k(
+        q_nc,
+        bk_nc,
+        bv_drop_tail,
+        bseg_nc,
+        gs_nc,
+        seg_nc,
+        compress_ratio=c,
+        index_head_dim=d_idx,
+        k_top=4,
+        block_chunk_size=mc_nc,
+    )
+    self.assertFalse(np.array_equal(np.asarray(ti_dropped[:, -1, :]), np.asarray(ti_ok[:, -1, :])))
+    self.assertNotIn(16, np.asarray(ti_dropped[:, -1, :]).tolist()[0])
+
+    # 7. Remat + outer scan: zero stacked [num_chunks, B, S, mc] residuals across all checkpoint policies.
+    s_rm = 48
+    pos_rm = jnp.tile(jnp.arange(s_rm, dtype=jnp.int32), (b, 1))
+    seg_rm = jnp.ones((b, s_rm), dtype=jnp.int32).at[:, 24:].set(2)
+    attn_rm = modeling_qwen3_8_flash_next.Qwen3_8SparseAttention(
+        emb_dim,
+        4,
+        2,
+        32,
+        0.25,
+        10000.0,
+        (2, 1, 1),
+        2,
+        1,
+        32,
+        16,
+        4,
+        1e-6,
+        jnp.float32,
+        jnp.float32,
+        attention_kernel="flash",
+        rngs=nnx.Rngs(79),
+    )
+    attn_rm.indexer.block_chunk_size = 2  # M=12, mc=2 -> num_chunks=6 (distinct from num_q_tiles=3 and layers=2)
+    gd_rm, params_rm, rest_rm = nnx.split(attn_rm, nnx.Param, ...)
+    stacked_p = jax.tree.map(lambda a: jnp.stack([a, a], axis=0), params_rm)
+    x_rm = jnp.array(rng.standard_normal((b, s_rm, emb_dim)), dtype=jnp.float32)
+
+    bad_remat_toks = (
+        "f32[6,2,48",
+        "i32[6,2,48",
+        "s32[6,2,48",
+        "bool[6,2,48",
+        "pred[6,2,48",
+        "f32[2,48,2,12]",
+        "f32[2,48,12]",
+    )
+    for pol in (
+        jax.checkpoint_policies.save_only_these_names("query_proj"),
+        jax.checkpoint_policies.nothing_saveable,
+        jax.checkpoint_policies.everything_saveable,
+    ):
+
+      def scanned_loss(h_in: jax.Array, sp_in: Any, pol_fn: Any = pol) -> jax.Array:
+        def body_fn(carry: jax.Array, p_slice: Any) -> tuple[jax.Array, None]:
+          @functools.partial(jax.checkpoint, policy=pol_fn, prevent_cse=True)
+          def _step(c_in: jax.Array, ps: Any) -> jax.Array:
+            mod = nnx.merge(gd_rm, ps, rest_rm)
+            out = mod(c_in, position_ids=pos_rm, segment_ids=seg_rm)
+            assert isinstance(out, jax.Array)
+            return c_in + out
+
+          return _step(carry, p_slice), None
+
+        h_out, _ = jax.lax.scan(body_fn, h_in, sp_in)
+        return jnp.sum(h_out)
+
+      jitted_grad = jax.jit(jax.grad(scanned_loss, argnums=(0, 1)))
+      lowered = jitted_grad.lower(x_rm, stacked_p)
+      lowered_str = lowered.as_text()
+      hlo_str = lowered.compile().as_text()
+      for bad_tok in bad_remat_toks:
+        self.assertNotIn(bad_tok, hlo_str)
+      for mlir_bad in ("tensor<6x2x48x", "tensor<2x48x2x12xf32>", "tensor<2x48x12xf32>"):
+        self.assertNotIn(mlir_bad, lowered_str)
+      _, g_params = jitted_grad(x_rm, stacked_p)
+      for leaf in jax.tree_util.tree_leaves(g_params["indexer"]):
+        self.assertEqual(float(jnp.max(jnp.abs(leaf))), 0.0)
+
+  def test_qsa_tiled_indexer_4device_sequence_sharding_hlo(self):
+    """Verifies tiled QSA indexer preserves length sharding with zero new collectives on 4-device CPU meshes."""
+    if len(jax.devices()) < 4:
+      self.skipTest("Requires 4 devices.")
+    rng = np.random.default_rng(1419)
+    b, s, emb_dim, h_idx, d_idx, c = 2, 80, 64, 4, 32, 4  # M = 20 != d_idx // 2 (16)
+    idx = modeling_qwen3_8_flash_next.Qwen3_8QSAIndexer(
+        emb_dim=emb_dim,
+        index_n_heads=h_idx,
+        index_kv_heads=1,
+        index_head_dim=d_idx,
+        token_budget=16,
+        compress_ratio=c,
+        dtype=jnp.float32,
+        weight_dtype=jnp.float32,
+        rngs=nnx.Rngs(29),
+    )
+    rope = modeling_qwen3_8_flash_next.Qwen3_8RotaryEmbedding(
+        head_dim=64, partial_rotary_factor=0.5, rope_theta=10000.0, mrope_section=(6, 5, 5)
+    )
+    x_ref = jnp.array(rng.standard_normal((b, s, emb_dim)), dtype=jnp.float32)
+    pos_ref = jnp.tile(jnp.arange(s, dtype=jnp.int32), (b, 1))
+    cos_ref, sin_ref = rope(x_ref, pos_ref)
+    seg_ref = jnp.ones((b, s), dtype=jnp.int32).at[:, 44:].set(2)
+    _, blk_ref = idx(x_ref, (cos_ref, sin_ref), segment_ids=seg_ref, return_token_mask=True)
+    gd_i, p_i, rest_i = nnx.split(idx, nnx.Param, ...)
+    P = jax.sharding.PartitionSpec
+
+    for axes, x_spec, expected_local_tile, forbidden_full in (
+        (("context", "tensor"), P(None, "context", None), "f32[2,40,4,4]", "f32[2,40,4,20]"),
+        (("fsdp", "expert"), P("fsdp", "expert", None), "f32[1,40,4,4]", "f32[1,40,4,20]"),
+    ):
+      mesh = jax.sharding.Mesh(np.array(jax.devices()[:4]).reshape(2, 2), axes)
+
+      def _ns(sp, m=mesh):
+        return jax.sharding.NamedSharding(m, sp)
+
+      seg_spec = P(x_spec[0], x_spec[1])
+      repl_x_spec = P(x_spec[0], None, None)
+      with jax.set_mesh(mesh):
+        x_s = jax.device_put(x_ref, _ns(x_spec))
+        cos_s = jax.device_put(cos_ref, _ns(x_spec))
+        sin_s = jax.device_put(sin_ref, _ns(x_spec))
+        seg_s = jax.device_put(seg_ref, _ns(seg_spec))
+        p_s = jax.tree.map(lambda a, ns_fn=_ns: jax.device_put(a, ns_fn(P())), p_i)
+
+        fn_tiled = jax.jit(
+            lambda pp, xi, ci, si, sgi: nnx.merge(gd_i, pp, rest_i)(
+                xi, (ci, si), segment_ids=sgi, return_token_mask=False, block_chunk_size=4
+            )[1]
+        )
+        fn_dense = jax.jit(
+            lambda pp, xi, ci, si, sgi: nnx.merge(gd_i, pp, rest_i)(
+                xi, (ci, si), segment_ids=sgi, return_token_mask=False, block_chunk_size=20
+            )[1]
+        )
+        fn_pos_ctrl = jax.jit(
+            lambda pp, xi, ci, si, sgi, rspec=repl_x_spec: nnx.merge(gd_i, pp, rest_i)(
+                jax.lax.with_sharding_constraint(xi, rspec),
+                (ci, si),
+                segment_ids=sgi,
+                return_token_mask=False,
+                block_chunk_size=4,
+            )[1]
+        )
+        blk_s = fn_tiled(p_s, x_s, cos_s, sin_s, seg_s)
+        np.testing.assert_array_equal(np.asarray(blk_s), np.asarray(blk_ref))
+
+        hlo_t = fn_tiled.lower(p_s, x_s, cos_s, sin_s, seg_s).compile().as_text()
+        hlo_d = fn_dense.lower(p_s, x_s, cos_s, sin_s, seg_s).compile().as_text()
+        hlo_pos = fn_pos_ctrl.lower(p_s, x_s, cos_s, sin_s, seg_s).compile().as_text()
+
+        # Tiled path must introduce zero new all-gather or all-reduce ops vs dense; positive control adds one.
+        self.assertLessEqual(hlo_t.count("all-gather("), hlo_d.count("all-gather("))
+        self.assertLessEqual(hlo_t.count("all-reduce("), hlo_d.count("all-reduce("))
+        self.assertGreater(hlo_pos.count("all-gather("), hlo_t.count("all-gather("))
+        self.assertIn(expected_local_tile, hlo_t)
+        self.assertNotIn(forbidden_full, hlo_t)
+        self.assertIn(forbidden_full, hlo_d)
+
+    # Also verify tiled_qsa_top_k under ShardMode.EXPLICIT (forward + grad) on (fsdp=2, context=2).
+    mesh_expl = jax.sharding.Mesh(
+        np.array(jax.devices()[:4]).reshape(2, 2),
+        ("fsdp", "context"),
+        axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+    )
+
+    def _ns_e(sp):
+      return jax.sharding.NamedSharding(mesh_expl, sp)
+
+    m_blk = s // c
+    q_e0 = jnp.array(rng.standard_normal((b, s, h_idx, d_idx)), dtype=jnp.bfloat16)
+    bk_e0 = jnp.array(rng.standard_normal((b, m_blk, d_idx)), dtype=jnp.bfloat16)
+    bv_e0 = jnp.ones((b, m_blk), dtype=bool)
+    gs_e0 = jnp.broadcast_to(jnp.arange(m_blk, dtype=jnp.int32)[None, :] * c, (b, m_blk))
+    bs_e0 = jnp.ones((b, m_blk), dtype=jnp.int32)
+    with jax.set_mesh(mesh_expl):
+      q_e = jax.device_put(q_e0, _ns_e(P("fsdp", "context", None, None)))
+      bk_e = jax.device_put(bk_e0, _ns_e(P("fsdp", None, None)))
+      bv_e = jax.device_put(bv_e0, _ns_e(P("fsdp", None)))
+      bs_e = jax.device_put(bs_e0, _ns_e(P("fsdp", None)))
+      gs_e = jax.device_put(gs_e0, _ns_e(P("fsdp", None)))
+      seg_e = jax.device_put(jnp.ones((b, s), dtype=jnp.int32), _ns_e(P("fsdp", "context")))
+      gq, gbk = jax.jit(
+          jax.grad(
+              lambda qq, kk: jnp.sum(
+                  modeling_qwen3_8_flash_next.tiled_qsa_top_k(
+                      qq, kk, bv_e, bs_e, gs_e, seg_e, compress_ratio=c, index_head_dim=d_idx, k_top=4, block_chunk_size=4
+                  )[0]
+              ),
+              argnums=(0, 1),
+          )
+      )(q_e, bk_e)
+      self.assertEqual(float(jnp.max(jnp.abs(gq))), 0.0)
+      self.assertEqual(float(jnp.max(jnp.abs(gbk))), 0.0)
+
+  def test_qsa_tiled_indexer_default_off_lowered_hlo_identity(self):
+    """Verifies return_token_mask=True and dense attention emit identical lowered HLO to the untiled dense path."""
+
+    def _norm_stablehlo(txt: str) -> str:
+      txt = re.sub(r"module @\S+", "module @jit_fn", txt)
+      return re.sub(r" loc\([^)]*\)", "", txt)
+
+    def _ref_dense_indexer(mod, hidden_states, position_embeddings, segment_ids=None, return_token_mask=True):
+      bsz, seq, _ = hidden_states.shape
+      cr = mod.compress_ratio
+      full_cos, full_sin = position_embeddings
+      curr_cos, curr_sin = full_cos[:, -seq:, :], full_sin[:, -seq:, :]
+      qk = mod.index_qk_proj(hidden_states)
+      q_dim = mod.index_n_heads * mod.index_head_dim
+      q = mod.q_layernorm(qk[..., :q_dim].reshape(bsz, seq, mod.index_n_heads, mod.index_head_dim))
+      q_rot = modeling_qwen3_8_flash_next.apply_rotary_pos_emb(q, cos=curr_cos, sin=curr_sin, unsqueeze_dim=2)
+      assert isinstance(q_rot, jax.Array)
+      raw_keys = qk[..., q_dim:].reshape(bsz, seq, mod.index_head_dim)
+      unpacked = segment_ids is None
+      if segment_ids is None:
+        segment_ids = jnp.ones((bsz, seq), dtype=jnp.int32)
+      if unpacked:
+        doc_start = jnp.zeros((bsz, seq), dtype=jnp.int32)
+      else:
+        pos_grid = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None, :], (bsz, seq))
+        sorted_seg, sorted_pos = jax.lax.sort([segment_ids.astype(jnp.int32), pos_grid], dimension=-1, is_stable=True)
+        is_first = jnp.concatenate([jnp.ones((bsz, 1), dtype=bool), sorted_seg[:, 1:] != sorted_seg[:, :-1]], axis=-1)
+        first_sorted_idx = jax.lax.associative_scan(jnp.maximum, jnp.where(is_first, pos_grid, 0), axis=-1)
+        sorted_doc_start = jnp.where(sorted_seg != 0, jnp.take_along_axis(sorted_pos, first_sorted_idx, axis=-1), 0)
+        doc_start = (
+            jnp.zeros((bsz, seq), dtype=jnp.int32)
+            .at[jnp.arange(bsz, dtype=jnp.int32)[:, None], sorted_pos]
+            .set(sorted_doc_start)
+        )
+      num_blocks = max(1, seq // cr)
+      local_pos, end_t = jnp.arange(seq)[None, :] - doc_start, jnp.clip(jnp.arange(seq) + cr - 1, 0, seq - 1)
+      is_block_start = (
+          (segment_ids != 0)
+          & ((local_pos % cr) == 0)
+          & ((jnp.arange(seq) + cr - 1 < seq)[None, :])
+          & (segment_ids[:, end_t] == segment_ids)
+      )
+      group_starts = jax.vmap(lambda mk: jnp.nonzero(mk, size=num_blocks, fill_value=0)[0])(is_block_start)
+      block_valid = jnp.arange(num_blocks)[None, :] < jnp.sum(is_block_start.astype(jnp.int32), axis=-1, keepdims=True)
+      block_seg_ids = jnp.take_along_axis(segment_ids, group_starts, axis=1)
+      block_token_idx = jnp.clip(group_starts[:, :, None] + jnp.arange(cr)[None, None, :], 0, seq - 1)
+      block_keys_raw = jax.vmap(lambda k, ix: k[ix])(raw_keys, block_token_idx)
+      pooled_keys = mod.k_layernorm(jnp.mean(block_keys_raw.astype(jnp.float32), axis=2).astype(raw_keys.dtype))
+      cos_blk = jax.vmap(lambda cb, ix: cb[ix])(full_cos, group_starts)
+      sin_blk = jax.vmap(lambda sb, ix: sb[ix])(full_sin, group_starts)
+      res = modeling_qwen3_8_flash_next.apply_rotary_pos_emb(
+          pooled_keys[:, :, None, :], cos=cos_blk, sin=sin_blk, unsqueeze_dim=2
+      )
+      assert isinstance(res, jax.Array)
+      block_keys = res.squeeze(2)
+      k_top = min(mod.block_topk, num_blocks)
+      raw_scores = jnp.einsum("bthd,bmd->bthm", q_rot.astype(jnp.float32), block_keys.astype(jnp.float32))
+      scores = jnp.sum(jax.nn.relu(raw_scores), axis=2) / jnp.sqrt(float(mod.index_head_dim))
+      valid_q_block = (
+          block_valid[:, None, :]
+          & (block_seg_ids[:, None, :] == segment_ids[:, :, None])
+          & ((group_starts + cr - 1)[:, None, :] <= jnp.arange(seq)[None, :, None])
+          & (segment_ids[:, :, None] != 0)
+      )
+      top_vals, top_indices = jax.lax.top_k(jnp.where(valid_q_block, scores, -1e9), k_top)
+      doc_local_idx = (jnp.take_along_axis(group_starts[:, None, :], top_indices, axis=2) - doc_start[:, :, None]) // cr
+      selected_block_indices = jnp.where(top_vals > -1e8, doc_local_idx, -1).astype(jnp.int32)
+      if mod.block_topk > k_top:
+        selected_block_indices = jnp.pad(
+            selected_block_indices, ((0, 0), (0, 0), (0, mod.block_topk - k_top)), constant_values=-1
+        )
+      if not return_token_mask:
+        return None, selected_block_indices
+      same_doc = (segment_ids[:, :, None] == segment_ids[:, None, :]) & (segment_ids[:, :, None] != 0)
+      m_local = jnp.arange(num_blocks)[None, None, :]
+      in_topk = jnp.any(
+          (selected_block_indices[:, :, :, None] == m_local) & (selected_block_indices[:, :, :, None] >= 0), axis=2
+      )
+      ar_k, ar_q = jnp.arange(seq)[None, None, :], jnp.arange(seq)[None, :, None]
+      is_selected = jnp.take_along_axis(
+          in_topk, jnp.clip((ar_k - doc_start[:, :, None]) // cr, 0, num_blocks - 1), axis=-1
+      )
+      in_tail = ar_k >= (doc_start + ((jnp.arange(seq)[None, :] - doc_start + 1) // cr) * cr)[:, :, None]
+      token_mask = (same_doc & (ar_k <= ar_q) & (is_selected | in_tail))[:, None, :, :]
+      return token_mask, selected_block_indices
+
+    b, s, emb_dim, h_idx, d_idx, c = 2, 48, 64, 4, 32, 4  # num_blocks = 12 > block_topk = 4 > chunk = 2
+    idx = modeling_qwen3_8_flash_next.Qwen3_8QSAIndexer(
+        emb_dim=emb_dim,
+        index_n_heads=h_idx,
+        index_kv_heads=1,
+        index_head_dim=d_idx,
+        token_budget=16,
+        compress_ratio=c,
+        dtype=jnp.bfloat16,
+        weight_dtype=jnp.bfloat16,
+        rngs=nnx.Rngs(7),
+    )
+    idx_init_chunk = modeling_qwen3_8_flash_next.Qwen3_8QSAIndexer(
+        emb_dim=emb_dim,
+        index_n_heads=h_idx,
+        index_kv_heads=1,
+        index_head_dim=d_idx,
+        token_budget=16,
+        compress_ratio=c,
+        block_chunk_size=2,
+        dtype=jnp.bfloat16,
+        weight_dtype=jnp.bfloat16,
+        rngs=nnx.Rngs(7),
+    )
+    rope = modeling_qwen3_8_flash_next.Qwen3_8RotaryEmbedding(
+        head_dim=64, partial_rotary_factor=0.5, rope_theta=10000.0, mrope_section=(6, 5, 5)
+    )
+    x = jnp.ones((b, s, emb_dim), dtype=jnp.bfloat16)
+    pos = jnp.tile(jnp.arange(s, dtype=jnp.int32), (b, 1))
+    cos, sin = rope(x, pos)
+    seg = jnp.ones((b, s), dtype=jnp.int32).at[:, 28:].set(2)
+    gd, params, rest = nnx.split(idx, nnx.Param, ...)
+    gd_ic, params_ic, rest_ic = nnx.split(idx_init_chunk, nnx.Param, ...)
+
+    hlo_default = _norm_stablehlo(
+        jax.jit(lambda p, xi, ci, si, sgi: nnx.merge(gd, p, rest)(xi, (ci, si), segment_ids=sgi, return_token_mask=True))
+        .lower(params, x, cos, sin, seg)
+        .as_text()
+    )
+    hlo_call_chunk2 = _norm_stablehlo(
+        jax.jit(
+            lambda p, xi, ci, si, sgi: nnx.merge(gd, p, rest)(
+                xi, (ci, si), segment_ids=sgi, return_token_mask=True, block_chunk_size=2
+            )
+        )
+        .lower(params, x, cos, sin, seg)
+        .as_text()
+    )
+    hlo_init_chunk2 = _norm_stablehlo(
+        jax.jit(
+            lambda p, xi, ci, si, sgi: nnx.merge(gd_ic, p, rest_ic)(xi, (ci, si), segment_ids=sgi, return_token_mask=True)
+        )
+        .lower(params_ic, x, cos, sin, seg)
+        .as_text()
+    )
+    hlo_ref_dense = _norm_stablehlo(
+        jax.jit(
+            lambda p, xi, ci, si, sgi: _ref_dense_indexer(
+                nnx.merge(gd, p, rest), xi, (ci, si), segment_ids=sgi, return_token_mask=True
+            )
+        )
+        .lower(params, x, cos, sin, seg)
+        .as_text()
+    )
+    hlo_single_chunk = _norm_stablehlo(
+        jax.jit(
+            lambda p, xi, ci, si, sgi: nnx.merge(gd, p, rest)(
+                xi, (ci, si), segment_ids=sgi, return_token_mask=False, block_chunk_size=12
+            )[1]
+        )
+        .lower(params, x, cos, sin, seg)
+        .as_text()
+    )
+    hlo_ref_nomask = _norm_stablehlo(
+        jax.jit(
+            lambda p, xi, ci, si, sgi: _ref_dense_indexer(
+                nnx.merge(gd, p, rest), xi, (ci, si), segment_ids=sgi, return_token_mask=False
+            )[1]
+        )
+        .lower(params, x, cos, sin, seg)
+        .as_text()
+    )
+    hlo_tiled_active = _norm_stablehlo(
+        jax.jit(
+            lambda p, xi, ci, si, sgi: nnx.merge(gd, p, rest)(xi, (ci, si), segment_ids=sgi, return_token_mask=False)[1]
+        )
+        .lower(params, x, cos, sin, seg)
+        .as_text()
+    )
+
+    self.assertEqual(hlo_default, hlo_ref_dense)
+    self.assertEqual(hlo_default, hlo_call_chunk2)
+    self.assertEqual(hlo_default, hlo_init_chunk2)
+    self.assertEqual(hlo_single_chunk, hlo_ref_nomask)
+    self.assertNotIn("stablehlo.while", hlo_default)
+    # Positive control: active tiled path (return_token_mask=False) emits stablehlo.while and differs from dense.
+    self.assertIn("stablehlo.while", hlo_tiled_active)
+    self.assertNotEqual(hlo_tiled_active, hlo_ref_nomask)
+
+    # Default Qwen3_8SparseAttention (attention_kernel='dense') lowered HLO must also be unaffected by block_chunk_size.
+    attn_def = self._make_jax_qsa(emb_dim=emb_dim, rng_seed=11, token_budget=16)
+    attn_c2 = self._make_jax_qsa(emb_dim=emb_dim, rng_seed=11, token_budget=16)
+    attn_c2.indexer.block_chunk_size = 2
+    x32 = jnp.ones((b, s, emb_dim), dtype=jnp.float32)
+    gd_a1, p_a1, r_a1 = nnx.split(attn_def, nnx.Param, ...)
+    gd_a2, p_a2, r_a2 = nnx.split(attn_c2, nnx.Param, ...)
+    hlo_attn_def = _norm_stablehlo(
+        jax.jit(lambda p, xi, pi, sgi: nnx.merge(gd_a1, p, r_a1)(xi, pi, segment_ids=sgi))
+        .lower(p_a1, x32, pos, seg)
+        .as_text()
+    )
+    hlo_attn_c2 = _norm_stablehlo(
+        jax.jit(lambda p, xi, pi, sgi: nnx.merge(gd_a2, p, r_a2)(xi, pi, segment_ids=sgi))
+        .lower(p_a2, x32, pos, seg)
+        .as_text()
+    )
+    self.assertEqual(hlo_attn_def, hlo_attn_c2)
+    self.assertNotIn("stablehlo.while", hlo_attn_def)
 
 
 # =================================================================================================
