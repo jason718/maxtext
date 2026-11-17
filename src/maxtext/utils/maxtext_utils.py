@@ -2116,6 +2116,10 @@ def get_abstract_state_nnx(config, mesh, nnx_init_trainstate_fn, is_training=Tru
         is_leaf=lambda x: isinstance(x, NamedSharding),
     )
     nnx.update(state_mesh_shardings, state_params)
+  if is_training and config.selective_host_offload:
+    from maxtext.m3.infra import offload as m3_offload  # pylint: disable=import-outside-toplevel
+
+    state_mesh_shardings = m3_offload.apply_selective_memory_kind_to_shardings(abs_var_state, state_mesh_shardings)
 
   abstract_sharded_state = maxtext_utils_nnx.set_named_sharding_nnx(abstract_state, state_mesh_shardings)
   state_mesh_annotations = maxtext_utils_nnx.get_partition_spec_nnx(state_mesh_shardings)

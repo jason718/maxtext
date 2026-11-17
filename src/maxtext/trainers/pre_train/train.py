@@ -92,6 +92,7 @@ from maxtext.utils import maxtext_utils_nnx
 from maxtext.utils import train_utils
 from maxtext.utils import mllog_utils
 from maxtext.utils import gpu_collective_overlap_pass
+from maxtext.m3.infra import offload as m3_offload
 from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
 from maxtext.utils.vocabulary_tiling import vocab_tiling_nnx_loss
 
@@ -574,8 +575,15 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   state = nnx.merge(model, state)  # reconstruct TrainStateNNX
   loss_model, loss_params, loss_rng = state.model, None, None
 
+  selective_offload = m3_offload.has_selective_host_offload(state.model)
+
   # --- Gradient computation ---
   if config.gradient_accumulation_steps > 1:
+    if selective_offload:
+      raise ValueError(
+          "selective_host_offload=True with gradient_accumulation_steps > 1 is not supported in "
+          "train.py fused train_step; use MaxTextTrainingEngine for multi-microbatch accumulation."
+      )
     loss, aux, raw_grads = gradient_accumulation_loss_and_grad(
         loss_fn,
         config,
@@ -643,16 +651,33 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       )
       return loss, (aux, non_param_rest)
 
-    grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
-    # Potentially mark model's loops for double buffering on GPUs.
-    with max_utils.model_loop_unroll_context(config):
-      (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(curr_params, custom_params, rest, config, data)
+    if selective_offload:
+      with max_utils.model_loop_unroll_context(config):
+        (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = m3_offload.pure_value_and_grad(
+            diff_wrapper,
+            model_graphdef,
+            curr_params,
+            custom_params=custom_params,
+            rest=rest,
+            config=config,
+            data=data,
+        )
+    else:
+      grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
+      # Potentially mark model's loops for double buffering on GPUs.
+      with max_utils.model_loop_unroll_context(config):
+        (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(
+            curr_params, custom_params, rest, config, data
+        )
     nnx.update(state.model, nnx.State.merge(custom_grads, non_param_rest))
 
-  raw_grads = jax.tree_util.tree_map(
-      lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
-      raw_grads,
-  )
+  if selective_offload:
+    raw_grads = m3_offload.cast_grad_tree(raw_grads, config.grad_dtype)
+  else:
+    raw_grads = jax.tree_util.tree_map(
+        lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
+        raw_grads,
+    )
   if config.parameter_memory_host_offload:
     raw_grads = jax.device_put(
         raw_grads,
@@ -675,11 +700,17 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   # log_step_diagnostics: the updated router biases and this step's bias updates (see step_diagnostics).
   diag_bias_values, diag_bias_updates = [], []
 
-  if config.gradient_clipping_threshold > 0:
+  pre_raw_grad_norm = None
+  pre_grad_norm = None
+  if selective_offload:
+    grads, pre_raw_grad_norm, pre_grad_norm = m3_offload.clip_grads_and_norms(
+        raw_grads, config.gradient_clipping_threshold
+    )
+  elif config.gradient_clipping_threshold > 0:
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, None, config.gradient_clipping_threshold)
   else:
     grads = raw_grads
-  if config.optimizer_memory_host_offload:
+  if config.optimizer_memory_host_offload and not selective_offload:
     # state.optimizer is an NNX Optimizer module; state_mesh_shardings.optimizer
     # is an NNX State. Use nnx.state() to get a compatible State for device_put.
     device_opt_shardings = jax.tree_util.tree_map_with_path(
@@ -690,7 +721,14 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     opt_state = nnx.state(state.optimizer)
     new_opt_state = jax.device_put(opt_state, device_opt_shardings)
     nnx.update(state.optimizer, new_opt_state)
-  if config.skip_step_on_spikes:
+  host_param_sqnorms: dict[tuple, jax.Array] = {}
+  if selective_offload:
+    with m3_offload.capture_host_param_sqnorms() as host_param_sqnorms:
+      if config.skip_step_on_spikes:
+        state.apply_gradients(grads, loss=loss, grad_norm=pre_grad_norm)
+      else:
+        state.apply_gradients(grads)
+  elif config.skip_step_on_spikes:
     # The skip-step optimizer is a GradientTransformationExtraArgs that reads
     # loss/grad_norm to decide whether to zero the update on a spike. nnx
     # Optimizer.update forwards these kwargs to tx.update.
@@ -795,18 +833,27 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     if global_max_logit is not None:
       scalar_metrics["learning/max_logits"] = global_max_logit
 
+  def _param_norm(params_tree):
+    if selective_offload:
+      return m3_offload.l2norm_pytree_with_overrides(params_tree, host_param_sqnorms)
+    return max_utils.l2norm_pytree(params_tree)
+
   if not config.optimizer_memory_host_offload:
-    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
-    scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
+    scalar_metrics["learning/grad_norm"] = pre_grad_norm if selective_offload else max_utils.l2norm_pytree(grads)
+    scalar_metrics["learning/raw_grad_norm"] = (
+        pre_raw_grad_norm if selective_offload else max_utils.l2norm_pytree(raw_grads)
+    )
     model_params = nnx.state(new_state.model, nnx.Param)
-    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(model_params)
+    scalar_metrics["learning/param_norm"] = _param_norm(model_params)
 
   if getattr(config, "log_step_diagnostics", False):
     scalar_metrics.update(step_diagnostics(raw_grads, has_moe_overflow, diag_bias_values, diag_bias_updates))
     if "learning/raw_grad_norm" not in scalar_metrics:  # optimizer_memory_host_offload skips the norms above
-      scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
-      scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
-      scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(nnx.state(new_state.model, nnx.Param))
+      scalar_metrics["learning/raw_grad_norm"] = (
+          pre_raw_grad_norm if selective_offload else max_utils.l2norm_pytree(raw_grads)
+      )
+      scalar_metrics["learning/grad_norm"] = pre_grad_norm if selective_offload else max_utils.l2norm_pytree(grads)
+      scalar_metrics["learning/param_norm"] = _param_norm(nnx.state(new_state.model, nnx.Param))
 
   # Surface skip-step rejections as a TB metric. The skip-step optimizer stores
   # is_skipped in its opt_state; read it back off the optimizer just updated in place.
