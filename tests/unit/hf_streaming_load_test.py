@@ -586,6 +586,14 @@ class StreamingLoadTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "no HF tensor for params-decoder-decoder_norm-scale"):
       self._load("llama", scan_layers=True, edit_maps=no_hf_norm)
 
+  def test_tuple_hf_key_without_hook_raises(self):
+    def tuple_without_hook(param_map, hook_map):
+      param_map["params-decoder-logits_dense-kernel"] = ("model.embed_tokens.weight", "lm_head.weight")
+      hook_map.pop("params-decoder-logits_dense-kernel", None)
+
+    with self.assertRaisesRegex(ValueError, "tuple of HF tensors for params-decoder-logits_dense-kernel"):
+      self._load("llama", scan_layers=True, edit_maps=tuple_without_hook)
+
 
 class Float8SourceTest(parameterized.TestCase):
   """An FP8 HF tensor must not be cast into a wider MaxText weight without its scales."""
