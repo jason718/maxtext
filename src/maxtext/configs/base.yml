@@ -646,6 +646,10 @@ prefetch_fsdp_weights: false
 # and run them on the SparseCore dedicated to FSDP collectives. Hides them at the cost of extra HBM. Inhomogeneous
 # blocks prefetched per sub-layer defer them to the next sub-layer's step.
 prefetch_fsdp_defer_grad_reduce_scatter: false
+# With prefetch_fsdp_defer_grad_reduce_scatter=true on a multi-slice mesh with batch axes over DCN, pipeline
+# each weight gradient's DCN all-reduce one backward step behind its intra-slice FSDP reduce-scatter (set false
+# to fall back to single-stage reduction).
+prefetch_fsdp_two_stage_dcn: true
 
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores
 # The attention_type parameter determines the variants of attention, e.g. global or local_sliding
