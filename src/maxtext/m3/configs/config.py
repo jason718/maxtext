@@ -184,6 +184,22 @@ class TrainerConfig(BaseModel):
   remat_policy: str = "NONE"
   names_which_can_be_saved: list[str] = Field(default_factory=list)
   names_which_can_be_offloaded: list[str] = Field(default_factory=list)
+  prefetch_fsdp_weights: bool = Field(
+      default=False,
+      description=(
+          "Overlap next scanned layer's FSDP weight all-gather with current layer compute (requires"
+          " scan_layers=True and non-'none' remat_policy). Known limitation: remat_policy='minimal_offloaded'"
+          " compiles and matches numerics, but synchronous host-stack DMA stalls PCIe on TPU7x; pair with"
+          " remat_policy='full' or device-resident savepoints for peak throughput."
+      ),
+  )
+  prefetch_fsdp_defer_grad_reduce_scatter: bool = Field(
+      default=False,
+      description=(
+          "With prefetch_fsdp_weights and shard_mode='explicit', defer each layer's weight-gradient"
+          " reduce-scatter to the next layer's backward step (extra HBM for one layer of unreduced grads)."
+      ),
+  )
   enable_tile_search: bool = False
   tile_search_mode: str = "smart"
   tile_search_iters: int = 10
