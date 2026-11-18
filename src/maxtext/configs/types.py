@@ -4241,6 +4241,20 @@ class VLLM(BaseModel):
           "the legacy transfer_state_directly / transfer_state_with_mappings paths."
       ),
   )
+  use_weight_planner: bool = Field(
+      False,
+      description=(
+          "Route trainer->rollout weight sync through the consolidated weight planner "
+          "(maxtext.weights). Takes precedence over use_weight_converter."
+      ),
+  )
+  weight_sync_manifest_check: bool = Field(
+      False,
+      description=(
+          "Before staging a weight sync, compare the converted weights' names, shapes and dtypes "
+          "with the state the rollout published, and raise on any difference."
+      ),
+  )
   use_raiden_ffi: Optional[bool] = Field(
       None,
       description="Use Raiden FFI transport for weight sync.",
@@ -6733,6 +6747,16 @@ class MaxTextConfig(
         )
       if self.block_diffusion_canvas_policy == "seed_and_mask" and self.causal_block_size < 2:
         raise ValueError("`block_diffusion_canvas_policy='seed_and_mask'` requires `causal_block_size >= 2`.")
+    if self.use_weight_planner:
+      unsupported = {
+          "rollout_backend != 'maxtext'": self.rollout_backend != "maxtext",
+          "fp8_moe": self.fp8_moe,
+          "rollout_fp8_moe": self.rollout_fp8_moe,
+          "weight_dtype='float8_e4m3fn'": self.weight_dtype == DType.FLOAT8_E4M3FN,
+      }
+      rejected = [name for name, is_set in unsupported.items() if is_set]
+      if rejected:
+        raise ValueError(f"use_weight_planner=True does not yet support: {', '.join(rejected)}.")
     if self.quantize_kvcache and not self.kv_quant_axis:
       raise ValueError("`kv_quant_axis` cannot be empty when quantize_kvcache is True.")
     if self.mtp_reuse_input_embedding and self.use_multimodal:
