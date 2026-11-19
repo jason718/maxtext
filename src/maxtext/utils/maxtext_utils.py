@@ -263,10 +263,11 @@ def get_save_and_offload_names(config) -> tuple[list[str], list[str]]:
       Note ``([], [])`` here means "no names for this split", not that the policy saves nothing
       overall (e.g. ``save_out_proj`` still saves ``out_proj`` via ``save_only_these_names``).
   """
+  combine_save = ["moe_combine_order"] if getattr(config, "moe_ring_pipeline_mode", "none") == "combine_per_chunk" else []
   if config.remat_policy == "qkv_proj_offloaded":
-    return [], ["query_proj", "value_proj", "key_proj", "kv_proj"]
+    return list(combine_save), ["query_proj", "value_proj", "key_proj", "kv_proj"]
   if config.remat_policy == "minimal_offloaded":
-    return [], [
+    return list(combine_save), [
         "query_proj",
         "value_proj",
         "key_proj",
@@ -279,8 +280,10 @@ def get_save_and_offload_names(config) -> tuple[list[str], list[str]]:
         "mlpwo",
     ]
   if config.remat_policy == "custom":
-    save_names = _expand_gdn_remat_names(list(config.tensors_on_device or []))
-    offload_names = _expand_gdn_remat_names(list(config.tensors_to_offload or []))
+    offload_raw = list(config.tensors_to_offload or [])
+    extra_save = [n for n in combine_save if n not in offload_raw]
+    save_names = _expand_gdn_remat_names(list(config.tensors_on_device or []) + extra_save)
+    offload_names = _expand_gdn_remat_names(offload_raw)
     overlap = sorted(set(save_names) & set(offload_names))
     if overlap:
       raise ValueError(
