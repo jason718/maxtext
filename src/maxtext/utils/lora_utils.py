@@ -212,6 +212,17 @@ def setup_initial_lora_state(data_iterator, tx, config, mesh, checkpoint_manager
   lora_config = None
 
   if lora_adapter_path:
+    fp32_master_storage = getattr(config, "fp32_master_storage", "f32")
+    if isinstance(fp32_master_storage, str) and fp32_master_storage != "f32":
+      raise ValueError(
+          f"LoRA does not support fp32_master_storage={fp32_master_storage!r}; set fp32_master_storage='f32'."
+      )
+    opt_dev_gib = getattr(config, "optimizer_device_resident_gib", 0.0)
+    if isinstance(opt_dev_gib, (int, float)) and not isinstance(opt_dev_gib, bool) and opt_dev_gib > 0.0:
+      raise ValueError(
+          f"LoRA does not support optimizer_device_resident_gib > 0 (got {opt_dev_gib}); "
+          "set optimizer_device_resident_gib=0.0."
+      )
     max_logging.log(f"Setting initial state of LoRA with lora_adapter_path = {lora_adapter_path}")
     # pylint: disable=import-outside-toplevel
     from maxtext.common import train_state_nnx

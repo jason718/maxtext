@@ -754,6 +754,18 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
           "MaxTextTrainingEngine does not support parameter_memory_host_offload; set it to False. "
           "optimizer_memory_host_offload is supported."
       )
+    fp32_master_storage = getattr(training_config, "fp32_master_storage", "f32")
+    if isinstance(fp32_master_storage, str) and fp32_master_storage != "f32":
+      raise NotImplementedError(
+          "MaxTextTrainingEngine does not support fp32_master_storage="
+          f"{fp32_master_storage!r}; set fp32_master_storage='f32'."
+      )
+    opt_dev_gib = getattr(training_config, "optimizer_device_resident_gib", 0.0)
+    if isinstance(opt_dev_gib, (int, float)) and not isinstance(opt_dev_gib, bool) and opt_dev_gib > 0.0:
+      raise NotImplementedError(
+          "MaxTextTrainingEngine does not support optimizer_device_resident_gib > 0 "
+          f"(got {opt_dev_gib}); set optimizer_device_resident_gib=0.0."
+      )
     # `train.py` evaluates under `logical_axis_rules_for_eval`; this engine evaluates under the
     # training rules, so reject a different eval rule set rather than silently ignore it.
     eval_rules = _normalize_axis_rules(training_config.logical_axis_rules_for_eval or ())

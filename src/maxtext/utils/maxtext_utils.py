@@ -1937,8 +1937,11 @@ def setup_initial_state(
     # Always build the concrete init state, then overlay whatever we loaded. Anything the
     # checkpoint didn't carry (or a params-only load didn't touch) keeps its real init
     # value, so restore doesn't depend on knowing exactly what was saved.
-    if is_training and config.optimizer_memory_host_offload and not config.parameter_memory_host_offload:
-      # Initialize on device first, then move host-offloaded optimizer leaves to pinned_host in a
+    if is_training and (
+        (config.optimizer_memory_host_offload and not config.parameter_memory_host_offload)
+        or (config.parameter_memory_host_offload and getattr(config, "fp32_master_storage", "f32") == "residual16")
+    ):
+      # Initialize on device first, then move host-offloaded leaves to pinned_host in a
       # separate jit; a single jit with mixed memory kinds lets XLA CSE differently sharded zero
       # broadcasts in pinned_host.
       device_state_mesh_shardings = jax.tree_util.tree_map(
@@ -1980,28 +1983,29 @@ def setup_initial_state(
         raw_model_params = raw_model_params.to_pure_dict()
       if isinstance(raw_model_params, dict) and "params" in raw_model_params:
         raw_model_params = raw_model_params["params"]
-      target_pure = target_model.to_pure_dict() if hasattr(target_model, "to_pure_dict") else target_model
+      if not checkpointing.overlay_raw_params_with_residual16(state, raw_model_params):
+        target_pure = target_model.to_pure_dict() if hasattr(target_model, "to_pure_dict") else target_model
 
-      def _reshard_aligned(target, raw):
-        """Aligns raw arrays with target device shardings using Flax's native flatten_dict utilities."""
-        target_flat = traverse_util.flatten_dict(target)
-        raw_flat = traverse_util.flatten_dict(raw)
+        def _reshard_aligned(target, raw):
+          """Aligns raw arrays with target device shardings using Flax's native flatten_dict utilities."""
+          target_flat = traverse_util.flatten_dict(target)
+          raw_flat = traverse_util.flatten_dict(raw)
 
-        res_flat = {}
-        for k, target_val in target_flat.items():
-          if k in raw_flat and not isinstance(raw_flat[k], jax.ShapeDtypeStruct):
-            raw_val = raw_flat[k]
-            if hasattr(target_val, "sharding") and target_val.sharding is not None:
-              res_flat[k] = jax.device_put(raw_val, target_val.sharding)
+          res_flat = {}
+          for k, target_val in target_flat.items():
+            if k in raw_flat and not isinstance(raw_flat[k], jax.ShapeDtypeStruct):
+              raw_val = raw_flat[k]
+              if hasattr(target_val, "sharding") and target_val.sharding is not None:
+                res_flat[k] = jax.device_put(raw_val, target_val.sharding)
+              else:
+                res_flat[k] = raw_val
             else:
-              res_flat[k] = raw_val
-          else:
-            res_flat[k] = target_val
+              res_flat[k] = target_val
 
-        return traverse_util.unflatten_dict(res_flat)
+          return traverse_util.unflatten_dict(res_flat)
 
-      sharded_aligned = _reshard_aligned(target_pure, raw_model_params)
-      nnx.update(target_model, sharded_aligned)
+        sharded_aligned = _reshard_aligned(target_pure, raw_model_params)
+        nnx.update(target_model, sharded_aligned)
 
     if restored:
       is_emergency = isinstance(
@@ -2160,12 +2164,20 @@ def get_abstract_state_nnx(config, mesh, nnx_init_trainstate_fn, is_training=Tru
     )
     state_mesh_shardings.optimizer = optimizer_sharding
   if is_training and config.optimizer_memory_host_offload:
-    optimizer_sharding = jax.tree_util.tree_map_with_path(
-        maxtext_utils_nnx.move_memory_to_host,
-        state_mesh_shardings.optimizer,
-        is_leaf=lambda x: isinstance(x, NamedSharding),
-    )
-    state_mesh_shardings.optimizer = optimizer_sharding
+    device_resident_gib = float(getattr(config, "optimizer_device_resident_gib", 0.0) or 0.0)
+    if device_resident_gib > 0.0:
+      state_mesh_shardings = checkpointing.partition_optimizer_memory_shardings(
+          abstract_state,
+          state_mesh_shardings,
+          device_resident_gib=device_resident_gib,
+      )
+    else:
+      optimizer_sharding = jax.tree_util.tree_map_with_path(
+          maxtext_utils_nnx.move_memory_to_host,
+          state_mesh_shardings.optimizer,
+          is_leaf=lambda x: isinstance(x, NamedSharding),
+      )
+      state_mesh_shardings.optimizer = optimizer_sharding
   if is_training and config.parameter_memory_host_offload:
     assert config.param_scan_axis == 0, "You must set the scan axis 0 to enable parameter offloading."
     _, state_params, _ = nnx.split(state_mesh_shardings, nnx.Param, ...)

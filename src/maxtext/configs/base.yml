@@ -222,6 +222,10 @@ decoder_block: "llama2" # which style of decoderblock to use.
 # then you should explicitly set base_embed_dim, base_num_query_heads, base_num_kv_heads,
 # base_mlp_dim, base_num_decoder_layers and/or head_dim.
 weight_dtype: "float32"
+# Master weight storage format: "f32" (default) stores full float32 parameters; "residual16" stores working weights in
+# bfloat16 alongside signed int16 low-bit residuals in optimizer state to reconstruct exact float32 master weights on update
+# and checkpoint save.
+fp32_master_storage: "f32"
 # List of module names or patterns to keep unquantized even when weight_dtype is FP8.
 # For any module included here, its weights will be instantiated using `dtype` (e.g. bfloat16).
 # Accepted module names include: 'token_embedder', 'logits_dense', 'gate' (MoE router),

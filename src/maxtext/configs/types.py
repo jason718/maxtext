@@ -562,6 +562,17 @@ class DataTypes(BaseModel):
       ),
   )
   weight_dtype: DType = Field(DType.FLOAT32, description="The data type for model weights.")
+  fp32_master_storage: Literal["f32", "residual16"] = Field(
+      "f32",
+      description=(
+          "Storage format for float32 master weights on the pre-training path. 'f32' (default) keeps standard model"
+          " parameter storage. 'residual16' stores working model parameters in bfloat16 plus signed int16 residuals"
+          " in optimizer state, reconstructing exact float32 master weights during optimizer updates and Orbax"
+          " checkpoint saves. Because primal working weights are bfloat16, backward parameter gradients and FSDP"
+          " gradient reduce-scatters inside the backward pass run in bfloat16 (matching weight_dtype='bfloat16')"
+          " before being cast to float32 for microbatch gradient accumulation and master-weight optimizer updates."
+      ),
+  )
   matmul_precision: MatmulPrecision = Field(
       MatmulPrecision.DEFAULT,
       description="Precision level for matrix multiplications.",
@@ -571,6 +582,27 @@ class DataTypes(BaseModel):
       description="If True, sets activations to float32 before the nonlinearity.",
   )
   dtype_mm: str = Field("float32", description="Data type for multimodal model's vision encoder")
+
+  @model_validator(mode="after")
+  def validate_fp32_master_storage(self) -> "DataTypes":
+    """Validates compatibility of fp32_master_storage with weight_dtype and trainer modes."""
+    if self.fp32_master_storage == "residual16":
+      if self.weight_dtype not in (DType.FLOAT32, DType.BFLOAT16):
+        raise ValueError(
+            "fp32_master_storage='residual16' requires weight_dtype to be 'float32' or 'bfloat16', got"
+            f" {self.weight_dtype!r}."
+        )
+      if any(cls.__name__ == "RLConfig" for cls in type(self).__mro__):
+        raise ValueError("fp32_master_storage='residual16' is not supported on the post-training RL path (RLConfig).")
+      lora_cfg = getattr(self, "lora", None)
+      if getattr(lora_cfg, "enable_lora", False) is True:
+        raise ValueError("fp32_master_storage='residual16' is not supported with LoRA (lora.enable_lora=True).")
+      if getattr(self, "enable_diloco", False) is True:
+        raise ValueError("fp32_master_storage='residual16' is not supported with DiLoCo (enable_diloco=True).")
+      for post_train_flag in ("use_sft", "use_dpo", "use_grpo"):
+        if getattr(self, post_train_flag, False) is True:
+          raise ValueError(f"fp32_master_storage='residual16' is not supported with {post_train_flag}=True.")
+    return self
 
 
 class Quantization(BaseModel):
@@ -3629,6 +3661,14 @@ class Optimizer(BaseModel):
   """Configuration for the optimizer and learning rate schedule."""
 
   opt_type: OptimizerType = Field(OptimizerType.ADAMW, description="The type of optimizer to use.")
+  optimizer_device_resident_gib: float = Field(
+      0.0,
+      description=(
+          "With optimizer_memory_host_offload=True: keep the largest optimizer state leaves, up to this many GiB per"
+          " device, in device memory (HBM) between updates instead of pinned host memory. 0.0 (default) offloads every"
+          " optimizer leaf."
+      ),
+  )
   skip_step_on_spikes: bool = Field(
       False,
       description="If True, skip the training step when loss or gradient spike is detected.",
@@ -3687,6 +3727,25 @@ class Optimizer(BaseModel):
           "example: ['.*indexer.*']. If empty (default), all parameters are trained."
       ),
   )
+
+  @model_validator(mode="after")
+  def validate_optimizer_device_resident_gib(self) -> "Optimizer":
+    """Validates optimizer_device_resident_gib is finite, non-negative, and paired with supported host offload."""
+    gib = self.optimizer_device_resident_gib
+    if not math.isfinite(gib) or gib < 0:
+      raise ValueError(f"optimizer_device_resident_gib must be a finite number >= 0, got {gib}.")
+    if gib > 0:
+      if hasattr(self, "optimizer_memory_host_offload") and not self.optimizer_memory_host_offload:
+        raise ValueError(
+            "optimizer_device_resident_gib > 0 requires optimizer_memory_host_offload=True (without it every optimizer"
+            " leaf is already in device memory)."
+        )
+      lora_cfg = getattr(self, "lora", None)
+      if getattr(lora_cfg, "enable_lora", False) is True:
+        raise ValueError("optimizer_device_resident_gib > 0 is not supported with LoRA (lora.enable_lora=True).")
+      if getattr(self, "enable_diloco", False) is True:
+        raise ValueError("optimizer_device_resident_gib > 0 is not supported with DiLoCo (enable_diloco=True).")
+    return self
 
 
 class AdamW(BaseModel):

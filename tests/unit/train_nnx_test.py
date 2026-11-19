@@ -70,7 +70,9 @@ class _Cfg:
   gradient_accumulation_steps: int = 1
   shard_optimizer_over_data: bool = False
   optimizer_memory_host_offload: bool = False
+  optimizer_device_resident_gib: float = 0.0
   parameter_memory_host_offload: bool = False
+  fp32_master_storage: str = "f32"
   gradient_clipping_threshold: float = 0.0
   grad_dtype: jnp.dtype = jnp.float32
   record_internal_nn_metrics: bool = False
@@ -1403,6 +1405,107 @@ class TestNNXNamedScopeContext(unittest.TestCase):
     with profiler.nnx_named_scope_context():
       hlo = jax.jit(mod.__call__).lower(x).as_text(debug_info=True)
     self.assertIn("_Attn/query_norm/rsqrt", hlo)
+
+
+class TestResidual16AndOptBudgetTrainStep(unittest.TestCase):
+  """Tests pre_train.train_step with fp32_master_storage='residual16' and optimizer_device_resident_gib."""
+
+  def test_residual16_train_step_matches_f32_and_preserves_routed_bias_and_spike_skip(self):
+    tx_base = optax.adamw(learning_rate=1e-4, weight_decay=0.01)
+    tx_spike = optimizers.skip_step_on_spikes(tx_base, interval=4, scaling_factor=2.0)
+
+    cfg_f32 = _Cfg(
+        fp32_master_storage="f32",
+        routed_bias=True,
+        routed_bias_update_rate=1e-3,
+        skip_step_on_spikes=True,
+        grad_dtype=jnp.float32,
+    )
+    cfg_r16 = _Cfg(
+        fp32_master_storage="residual16",
+        routed_bias=True,
+        routed_bias_update_rate=1e-3,
+        skip_step_on_spikes=True,
+        grad_dtype=jnp.float32,
+    )
+
+    m_f32 = _TinyDecoderMoEBias(cfg_f32.vocab_size, hidden=8, rngs=nnx.Rngs(42))
+    m_r16 = _TinyDecoderMoEBias(cfg_r16.vocab_size, hidden=8, rngs=nnx.Rngs(42))
+    ts_f32 = train_state_nnx.create_train_state(m_f32, tx_spike, cfg_f32)
+    ts_r16 = train_state_nnx.create_train_state(m_r16, tx_spike, cfg_r16)
+
+    # Working weights are bf16 while routed gate.bias stays float32.
+    self.assertEqual(ts_r16.model.embed.embedding.get_value().dtype, jnp.bfloat16)
+    self.assertEqual(ts_r16.model.decoder.gate.bias.get_value().dtype, jnp.float32)
+
+    g_f32, s_f32 = nnx.split(ts_f32)
+    g_r16, s_r16 = nnx.split(ts_r16)
+    data = _make_data(batch=cfg_f32.micro_batch_size_to_train_on, vocab=cfg_f32.vocab_size)
+    data["targets"] = jnp.array([[1, 2, 3, 4], [4, 3, 2, 1]], dtype=jnp.int32)
+
+    for _ in range(3):
+      with jax.set_mesh(m_f32.mesh):
+        s_f32, met_f32 = pre_train.train_step(g_f32, cfg_f32, None, None, s_f32, data)
+      with jax.set_mesh(m_r16.mesh):
+        s_r16, met_r16 = pre_train.train_step(g_r16, cfg_r16, None, None, s_r16, data)
+      self.assertIn("optim/step_skipped", met_r16["scalar"])
+      np.testing.assert_allclose(
+          float(met_r16["scalar"]["learning/loss"]),
+          float(met_f32["scalar"]["learning/loss"]),
+          rtol=5e-3,
+          atol=5e-3,
+      )
+
+    pure_r16 = s_r16.to_pure_dict()
+    pure_f32 = s_f32.to_pure_dict()
+    np.testing.assert_allclose(
+        pure_r16["model"]["decoder"]["gate"]["bias"],
+        pure_f32["model"]["decoder"]["gate"]["bias"],
+        rtol=0,
+        atol=0,
+    )
+
+  def test_residual16_gradient_accumulation_and_partial_device_budget(self):
+    cfg = _Cfg(
+        fp32_master_storage="residual16",
+        gradient_accumulation_steps=2,
+        grad_dtype=jnp.float32,
+        optimizer_memory_host_offload=True,
+        optimizer_device_resident_gib=1e-6,  # ~1 KiB: fits larger leaf or smaller leaf selectively
+    )
+    cfg.global_batch_size_to_train_on = cfg.micro_batch_size_to_train_on * cfg.gradient_accumulation_steps
+    cfg.max_target_length = 4
+    model = _TinyDecoder(cfg.vocab_size, hidden=16, rngs=nnx.Rngs(7))
+    repl_dev = jax.sharding.NamedSharding(model.mesh, jax.sharding.PartitionSpec(), memory_kind="device")
+    ts = train_state_nnx.create_train_state(model, optax.adamw(1e-3), cfg)
+    graphdef, state = nnx.split(ts)
+
+    abstract_state = jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=repl_dev),
+        state,
+    )
+    base_shardings = jax.tree.map(lambda _: repl_dev, state)
+    part_shardings = train_state_nnx.partition_optimizer_memory_shardings(
+        abstract_state,
+        base_shardings,
+        device_resident_gib=cfg.optimizer_device_resident_gib,
+    )
+    opt_kinds = {
+        s.memory_kind
+        for s in jax.tree.leaves(
+            part_shardings.optimizer,
+            is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding),
+        )
+    }
+    self.assertEqual(opt_kinds, {"device", "pinned_host"})
+
+    _, params_shardings, _ = nnx.split(part_shardings.model, nnx.Param, ...)
+    data = _make_data(batch=cfg.micro_batch_size_to_train_on * cfg.gradient_accumulation_steps, vocab=cfg.vocab_size)
+    state = jax.device_put(state, part_shardings)
+    with jax.set_mesh(model.mesh):
+      out_state, metrics = pre_train.train_step(graphdef, cfg, part_shardings, params_shardings, state, data)
+    self.assertTrue(jnp.isfinite(metrics["scalar"]["learning/loss"]))
+    self.assertEqual(int(out_state["optimizer"]["step"].get_value()), 1)
 
 
 if __name__ == "__main__":

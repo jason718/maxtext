@@ -640,10 +640,16 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(curr_params, custom_params, rest, config, data)
     nnx.update(state.model, nnx.State.merge(custom_grads, non_param_rest))
 
-  raw_grads = jax.tree_util.tree_map(
-      lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
-      raw_grads,
-  )
+  if getattr(config, "fp32_master_storage", "f32") == "residual16" and config.grad_dtype == jnp.float32:
+    raw_grads = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+        raw_grads,
+    )
+  else:
+    raw_grads = jax.tree_util.tree_map(
+        lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
+        raw_grads,
+    )
   if config.parameter_memory_host_offload:
     raw_grads = jax.device_put(
         raw_grads,
@@ -679,7 +685,19 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         is_leaf=lambda x: isinstance(x, NamedSharding),
     )
     opt_state = nnx.state(state.optimizer)
-    new_opt_state = jax.device_put(opt_state, device_opt_shardings)
+    if getattr(config, "optimizer_device_resident_gib", 0.0) > 0.0:
+      new_opt_state = jax.tree_util.tree_map(
+          lambda arr, src_s, dst_s: (
+              jax.device_put(arr, dst_s)
+              if isinstance(src_s, NamedSharding) and src_s.memory_kind == "pinned_host"
+              else arr
+          ),
+          opt_state,
+          state_mesh_shardings.optimizer,
+          device_opt_shardings,
+      )
+    else:
+      new_opt_state = jax.device_put(opt_state, device_opt_shardings)
     nnx.update(state.optimizer, new_opt_state)
   if config.skip_step_on_spikes:
     # The skip-step optimizer is a GradientTransformationExtraArgs that reads
@@ -803,7 +821,12 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   # is_skipped in its opt_state; read it back off the optimizer just updated in place.
   if config.skip_step_on_spikes:
     opt_state = nnx.to_pure_dict(nnx.state(new_state.optimizer)).get("opt_state", {})
-    is_skipped = opt_state.get("is_skipped") if isinstance(opt_state, dict) else None
+    if isinstance(opt_state, dict):
+      is_skipped = opt_state.get("is_skipped")
+      if is_skipped is None and isinstance(opt_state.get("inner"), dict):
+        is_skipped = opt_state["inner"].get("is_skipped")
+    else:
+      is_skipped = None
     if is_skipped is not None:
       scalar_metrics["optim/step_skipped"] = is_skipped.astype(jnp.float32)
   metrics = {
