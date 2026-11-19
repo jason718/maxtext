@@ -92,6 +92,10 @@ class FlattenLeavesTest(unittest.TestCase):
     tree = {"base": {"a": _zeros((1,), jnp.float32)}, "vision": {"b": _zeros((2,), jnp.float32)}}
     self.assertEqual(sorted(layout.flatten_leaves(tree)), ["base.a", "vision.b"])
 
+  def test_two_different_wrapper_roots_side_by_side_are_kept(self):
+    tree = {"base": {"a": _zeros((1,), jnp.float32)}, "model": {"b": _zeros((2,), jnp.float32)}}
+    self.assertEqual(sorted(layout.flatten_leaves(tree)), ["base.a", "model.b"])
+
   def test_a_weight_named_like_a_wrapper_is_kept(self):
     self.assertEqual(list(layout.flatten_leaves({"model": _zeros((1,), jnp.float32)})), ["model"])
 
@@ -106,6 +110,11 @@ class FlattenLeavesTest(unittest.TestCase):
     self.assertIsInstance(flat["embedding"], jax.Array)
     frozen = FrozenDict({"base": {"decoder_norm": {"scale": np.ones((EMB,), np.float32)}}})
     self.assertEqual(list(layout.flatten_leaves(frozen)), ["decoder_norm.scale"])
+
+  def test_param_leaves_in_a_plain_dict_are_unwrapped_to_arrays(self):
+    flat = layout.flatten_leaves({"decoder": {"w": nnx.Param(jnp.ones((2, 3), jnp.bfloat16))}})
+    self.assertEqual(list(flat), ["decoder.w"])
+    self.assertIsInstance(flat["decoder.w"], jax.Array)
 
 
 class LeafSpecsTest(unittest.TestCase):
