@@ -339,9 +339,15 @@ WEIGHT_PLANNER_UNSUPPORTED = [
 ]
 
 
+def _rl_config_with(**overrides):
+  return pydantic_types.RLConfig(model_name="gemma4-26b", **overrides)
+
+
+# RL training builds an RLConfig, which does not inherit MaxTextConfig's validator.
+@pytest.mark.parametrize("make_config", [_base_config_with, _rl_config_with])
 @pytest.mark.parametrize("overrides, named", WEIGHT_PLANNER_UNSUPPORTED)
-def test_weight_planner_rejects_unsupported(overrides, named):
+def test_weight_planner_rejects_unsupported(make_config, overrides, named):
   # Each combination is valid without the planner, so the planner check is what rejects it.
-  _base_config_with(**overrides)
+  make_config(**overrides)
   with pytest.raises(ValidationError, match=f"does not yet support: {named}\\."):
-    _base_config_with(use_weight_planner=True, **overrides)
+    make_config(use_weight_planner=True, **overrides)
