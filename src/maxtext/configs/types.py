@@ -1486,12 +1486,41 @@ class MoEGeneral(BaseModel):
           " that jnp.take_along_axis transposes to. Forward and gradient values are unchanged."
       ),
   )
+  moe_exclude_padding_from_routing: bool = Field(
+      False,
+      description=(
+          "Train only. Exclude padding tokens (decoder_segment_ids == 0) from MoE routing via moe.routing_token_mask:"
+          " padded tokens get expert id -1 and weight 0, contribute nothing to group_sizes, ragged dispatch buffers,"
+          " load-balance loss or routed-bias updates, and get a zero routed-MoE output (and zero Qwen3-Next/Qwen3.5"
+          " gated shared-expert output). Non-padding tokens' routing and outputs are unchanged."
+      ),
+  )
+  moe_fallback_topk_capacity: int = Field(
+      0,
+      description=(
+          "Router replay (forced_routed_experts): 0 (default) keeps standard slot-level forced routing where ids"
+          " outside [0, num_experts) are unused slots. With a value > 0, tokens whose forced slots are not all valid"
+          " and distinct (excluding tokens masked out by token_mask) fall back to the router's own top-k selection,"
+          " computed on at most this many compacted rows via fallback_topk_indices_compacted (or on all rows via"
+          " jax.lax.cond when more tokens need fallback)."
+      ),
+  )
+  moe_roe_packed_routing_gather: bool = Field(
+      False,
+      description=(
+          "Ring of experts with moe_topk_before_ep_all_gather=True: route all local tokens of the layer once and"
+          " all-gather the top-k routing weights and expert ids over the expert-parallel axis as a single float32"
+          " [batch, seq, 2 * top_k] array (tagged moe_routing_maps when moe_routing_maps != 'remat') instead of two"
+          " all-gathers per token chunk. Requires sparse_matmul=True, te_moe_block=False, use_ring_of_experts=True,"
+          " moe_topk_before_ep_all_gather=True, use_random_routing=False and num_moe_emb_chunks <= 0."
+      ),
+  )
   moe_topk_before_ep_all_gather: bool = Field(
       False,
       description=(
           "Ring of experts: run top-k on the local tokens and all-gather the top-k weights and expert ids"
           " instead of the full router logits. The token sort still runs after the all-gather."
-          " Ignored with forced, hash or random routing."
+          " Ignored with hash or random routing."
       ),
   )
   use_ring_of_experts: bool = Field(
@@ -1906,6 +1935,57 @@ class MoEGeneral(BaseModel):
       description="Whether to fuse the expert scaling factors into the expert weights. "
       "This can improve inference performance.",
   )
+
+  @model_validator(mode="after")
+  def validate_moe_exclude_padding_from_routing(self) -> "MoEGeneral":
+    """Rejects MoE implementations that bypass RoutedMoE's token_mask when moe_exclude_padding_from_routing=True."""
+    if self.moe_exclude_padding_from_routing and self.num_experts > 1:
+      MoEGeneral._reject_unless(
+          "moe_exclude_padding_from_routing=True",
+          [
+              (not self.te_moe_block, "te_moe_block=False"),
+              (not self.use_batch_split_schedule, "use_batch_split_schedule=False"),
+              (not getattr(self, "use_lineage", False), "use_lineage=False"),
+              (not getattr(self, "use_m3_model", False), "use_m3_model=False"),
+              (
+                  getattr(self, "decoder_block", None) != DecoderBlockType.KIMI_LINEAR,
+                  "decoder_block != 'kimi_linear'",
+              ),
+          ],
+      )
+    return self
+
+  @model_validator(mode="after")
+  def validate_moe_fallback_topk_capacity(self) -> "MoEGeneral":
+    """moe_fallback_topk_capacity is a row count: 0 (off) or positive."""
+    if self.moe_fallback_topk_capacity < 0:
+      raise ValueError(f"moe_fallback_topk_capacity must be >= 0, got {self.moe_fallback_topk_capacity}.")
+    if self.moe_fallback_topk_capacity > 0:
+      MoEGeneral._reject_unless(
+          f"moe_fallback_topk_capacity={self.moe_fallback_topk_capacity}",
+          [
+              (not self.te_moe_block, "te_moe_block=False"),
+              (not self.use_random_routing, "use_random_routing=False"),
+          ],
+      )
+    return self
+
+  @model_validator(mode="after")
+  def validate_moe_roe_packed_routing_gather(self) -> "MoEGeneral":
+    """Packed routing gather replaces the per-chunk local-routing all-gathers in Ring of Experts."""
+    if self.moe_roe_packed_routing_gather:
+      MoEGeneral._reject_unless(
+          "moe_roe_packed_routing_gather=True",
+          [
+              (self.sparse_matmul, "sparse_matmul=True"),
+              (not self.te_moe_block, "te_moe_block=False"),
+              (self.use_ring_of_experts, "use_ring_of_experts=True"),
+              (self.moe_topk_before_ep_all_gather, "moe_topk_before_ep_all_gather=True"),
+              (not self.use_random_routing, "use_random_routing=False"),
+              (self.num_moe_emb_chunks <= 0, "num_moe_emb_chunks <= 0"),
+          ],
+      )
+    return self
 
   @model_validator(mode="after")
   def validate_moe_sharding_strategy(self) -> "MoEGeneral":
