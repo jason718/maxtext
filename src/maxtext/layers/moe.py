@@ -2900,20 +2900,24 @@ class RoutedMoE(nnx.Module):
       """Reads a forward GMM tile size, preferring `eval_*` under eval axis rules."""
       return getattr(self.config, f"eval_{name}" if max_utils.is_eval(self.config) else name)
 
-    def jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount):
+    def jax_ragged_dot_gmm(
+        inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount, *, rhs_transpose=False
+    ):
       """Execute jax.lax.ragged_dot, with potential quantization"""
-      m, k, n = inputs.shape[0], inputs.shape[1], kernel.shape[2]
+      rhs_inputs = kernel
+      if isinstance(kernel, aqt.QTensor):
+        if kernel.bias or kernel.sparsity_mask or len(kernel.scale) > 1:
+          raise ValueError("Unsupported usecase for ragged_dot with quantized kernel.")
+        rhs_inputs = kernel.qvalue
+      if rhs_transpose:
+        rhs_inputs = jnp.swapaxes(rhs_inputs, 1, 2)
+      m, k, n = inputs.shape[0], inputs.shape[1], rhs_inputs.shape[2]
       # Clamps the tile size using the minimum
       tiling = (
           min(tiling[0], m),
           min(tiling[1], k),
           min(tiling[2], n),
       )
-      rhs_inputs = kernel
-      if isinstance(kernel, aqt.QTensor):
-        if kernel.bias or kernel.sparsity_mask or len(kernel.scale) > 1:
-          raise ValueError("Unsupported usecase for ragged_dot with quantized kernel.")
-        rhs_inputs = kernel.qvalue
       if self.config.quantization and self.config.use_qwix_quantization:
         # Use full contraction for QWIX quantization to allow quantization
         # fusion (max reduce over contracting dimension).
@@ -3038,6 +3042,8 @@ class RoutedMoE(nnx.Module):
         tc_routing=None,
         tc_unsort_cfg=None,
         bias=None,
+        rhs_transpose=False,
+        fwd_rhs_buffer_count=None,
     ):
       def extract_vma(tensor):
         # Extract underlying array from QArray to inspect sharding annotation string.
@@ -3185,6 +3191,9 @@ class RoutedMoE(nnx.Module):
             fuse_3d_dlhs_ps=self.config.moe_3d_dlhs_partial_sum,
             **({"out_is_3d": True} if out_is_3d else {}),
             **({"tc_routing": tc_routing, "tc_unsort_cfg": tc_unsort_cfg} if tc_unsort_cfg is not None else {}),
+            **({"enable_subtile_m": True} if getattr(self.config, "enable_subtile_m", False) else {}),
+            **({"rhs_transpose": True} if rhs_transpose else {}),
+            **({"fwd_rhs_buffer_count": fwd_rhs_buffer_count} if fwd_rhs_buffer_count is not None else {}),
         )
       else:
         # jax.lax.ragged_dot takes no group_offset and expects one group per expert in `kernel`.
@@ -3200,6 +3209,7 @@ class RoutedMoE(nnx.Module):
             local_group_sizes,
             expert_assignments,
             padding_amount,
+            **({"rhs_transpose": True} if rhs_transpose else {}),
         )
         if row_start is not None:
           output = jnp.roll(output, row_start, axis=0)
@@ -3362,6 +3372,27 @@ class RoutedMoE(nnx.Module):
         decoder_tokens_pspec,
     ) = get_routed_moe_shardings(is_batch_sharded_by_expert, input_ids is not None)
     w0_pspec, w1_pspec, wo_pspec = maybe_aqt_partition(w0_kernel, w0_pspec, w1_kernel, w1_pspec, wo_kernel, wo_pspec)
+
+    def _pspec_dim(pspec, idx):
+      return pspec[idx] if isinstance(pspec, P) and idx < len(pspec) else None
+
+    use_wo_rhs_transpose = (
+        getattr(self.config, "moe_wo_rhs_transpose", False)
+        and not weight_gather
+        and not _reduced_axes(wo_kernel)
+        and not isinstance(wo_kernel, (aqt.QTensor, qpl.QArray))
+        and wo_kernel.ndim == 3
+        and isinstance(wo_pspec, P)
+    )
+    wo_t_pspec = (
+        P(_pspec_dim(wo_pspec, 0), _pspec_dim(wo_pspec, 2), _pspec_dim(wo_pspec, 1)) if use_wo_rhs_transpose else wo_pspec
+    )
+    wo_param_pspec = self._logical_to_mesh_axes(self.wo_kernel_axes) if use_wo_rhs_transpose else None
+    wo_t_param_pspec = (
+        P(_pspec_dim(wo_param_pspec, 0), _pspec_dim(wo_param_pspec, 2), _pspec_dim(wo_param_pspec, 1))
+        if use_wo_rhs_transpose and isinstance(wo_param_pspec, P)
+        else None
+    )
 
     output_pspec = self._logical_to_mesh_axes(
         (
@@ -3999,6 +4030,7 @@ class RoutedMoE(nnx.Module):
       if not gather_weights:
         wi_gather_axes = []
       use_te_bias = self.config.use_te_grouped_gemm and self.config.mlp_bias
+      wi_rhs_buffers = getattr(self.config, "wi_tile_fwd_rhs_buffer_count", None)
 
       def _gmm_maybe_bias(x_, w_, bias_, partial_sum=None, *, return_lhs=False, return_rhs=False):
         # With return_lhs / return_rhs, gmm returns (out, [lhs], [rhs]); bias and mask apply to `out` only.
@@ -4012,6 +4044,7 @@ class RoutedMoE(nnx.Module):
             return_lhs=return_lhs,
             return_rhs=return_rhs,
             bias=bias_ if te_bias else None,
+            **({"fwd_rhs_buffer_count": wi_rhs_buffers} if wi_rhs_buffers is not None else {}),
         )
         layer, extras = (res[0], tuple(res[1:])) if return_lhs or return_rhs else (res, ())
         if te_bias:
@@ -4594,6 +4627,7 @@ class RoutedMoE(nnx.Module):
           bias=wo_bias if use_te_wo_bias else None,
           return_rhs=return_weights,
           **({"out_is_3d": True} if x_is_3d else {}),
+          **({"rhs_transpose": True} if use_wo_rhs_transpose else {}),
           **tc_unsort_kwargs,
       )
       if return_weights:
@@ -4742,7 +4776,7 @@ class RoutedMoE(nnx.Module):
         pre_bias_logits_pspec,
         keep_reduced(w0_pspec, w0_kernel),
         keep_reduced(w1_pspec, w1_kernel),
-        keep_reduced(wo_pspec, wo_kernel),
+        keep_reduced(wo_t_pspec, wo_kernel),
         w0_bias_pspec,
         w1_bias_pspec,
         wo_bias_pspec,
@@ -5123,7 +5157,32 @@ class RoutedMoE(nnx.Module):
     # Weights already all-gathered (typed `reduced`) by fsdp_prefetch skip the reshard, which would drop the type.
     w0_kernel = w0_kernel if _reduced_axes(w0_kernel) else _fsdp_all_gather(w0_kernel, w0_pspec)
     w1_kernel = w1_kernel if _reduced_axes(w1_kernel) else _fsdp_all_gather(w1_kernel, w1_pspec)
-    wo_kernel = wo_kernel if _reduced_axes(wo_kernel) else _fsdp_all_gather(wo_kernel, wo_pspec)
+    if use_wo_rhs_transpose:
+      if self.config.shard_mode == ShardMode.EXPLICIT:
+        wo_kernel = _fsdp_all_gather(jnp.swapaxes(wo_kernel, 1, 2), wo_t_pspec)
+      else:
+
+        @jax.custom_vjp
+        def _gather_transposed_wo(w):
+          w_t = jnp.swapaxes(w, 1, 2)
+          if wo_t_param_pspec is not None:
+            w_t = self._maybe_shard_with_pspec(w_t, wo_t_param_pspec)
+          return _fsdp_all_gather(w_t, wo_t_pspec)
+
+        def _gather_transposed_wo_fwd(w):
+          return _gather_transposed_wo(w), None
+
+        def _gather_transposed_wo_bwd(_, g_t):
+          g_t = self._maybe_shard_with_pspec(g_t, wo_t_pspec)
+          if wo_t_param_pspec is not None:
+            g_t = self._maybe_shard_with_pspec(g_t, wo_t_param_pspec)
+            g_t = jax.lax.optimization_barrier(g_t)
+          return (jnp.swapaxes(g_t, 1, 2),)
+
+        _gather_transposed_wo.defvjp(_gather_transposed_wo_fwd, _gather_transposed_wo_bwd)
+        wo_kernel = _gather_transposed_wo(wo_kernel)
+    else:
+      wo_kernel = wo_kernel if _reduced_axes(wo_kernel) else _fsdp_all_gather(wo_kernel, wo_pspec)
     if w0_bias is not None:
       w0_bias = _fsdp_all_gather(w0_bias, w0_bias_pspec)
     if w1_bias is not None:
