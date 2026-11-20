@@ -2787,6 +2787,9 @@ class PipelineParallelism(BaseModel):
           " emitted in every microbatch iteration and left to XLA to move out of the loop. Numerically identical."
       ),
   )
+  # Maintainer note: New pipeline schedule options or loop-splitting flags should register with
+  # src/maxtext/utils/pipeline_trace_lens.py (register_pipeline_schedule) and update
+  # docs/guides/optimization/pipeline_parallelism_profiling.md.
   num_layers_per_pipeline_stage: int = Field(1, description="Number of layers to place on each pipeline stage.")
   num_pipeline_repeats: int = Field(
       -1,
@@ -3973,6 +3976,18 @@ class Profiling(ProfilingCore):
   jax_profiler_port: int = Field(9999, description="Port for the JAX profiler.")
   enable_tpu_profiling_options: bool = Field(False, description="Enable TPU advanced profiling options.")
   tpu_num_chips_to_profile_per_task: int = Field(1, description="Specifies the number of TPU chips to profile per task.")
+  profile_all_local_chips: bool = Field(
+      False,
+      description="With enable_tpu_profiling_options, trace every local chip of each profiled process"
+      " (overrides tpu_num_chips_to_profile_per_task).",
+  )
+  enable_pipeline_stage_profiling: bool = Field(
+      True,
+      description="When True and using pipeline parallelism with profiler='xplane', automatically profile one"
+      " representative process per pipeline stage, synchronize trace flush across processes, and merge the decoded"
+      " cross-stage pipeline timeline in-place into Process 0's .xplane.pb for XProf. Set to False to restore"
+      " legacy Process-0-only profiling.",
+  )
   tpu_num_sparse_cores_to_trace: int = Field(2, description="Specifies the number of TPU chips to profile per task.")
   tpu_num_sparse_core_tiles_to_trace: int = Field(
       1,
