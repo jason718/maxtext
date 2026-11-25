@@ -1280,8 +1280,28 @@ def mesh_device_log_lines(config, mesh) -> list[str]:
   return lines
 
 
+_PENDING_STEP_PROBES = []
+
+
 def _maybe_log_required_rbf(config, step, metrics, program):
-  """log_required_ragged_buffer_factor probe: one REQUIRED_RBF line per train program run (fetches the vector)."""
+  """log_required_ragged_buffer_factor probe: one REQUIRED_RBF line per train program run (fetches the vector).
+
+  With log_probes_deferred, a step's probe lines (REQUIRED_RBF, MOE-DROPPED, NONFINITE) are written after the next
+  step is dispatched (and the last step's at once), as LOSS-PARTS: fetching them right after the dispatch blocks the
+  host until the step ends, so the next batch's host-to-device copy cannot overlap the step. Same lines, same values.
+  """
+  if not getattr(config, "log_probes_deferred", False):
+    _log_step_probes(config, step, metrics, program)
+    return
+  keep = {k: metrics[k] for k in ("nonfinite_probe", "moe_required_rbf") if k in metrics}
+  _PENDING_STEP_PROBES.append((step, keep, program))
+  while len(_PENDING_STEP_PROBES) > 1 or (_PENDING_STEP_PROBES and step >= config.steps - 1):
+    p_step, p_metrics, p_program = _PENDING_STEP_PROBES.pop(0)
+    _log_step_probes(config, p_step, p_metrics, p_program)
+
+
+def _log_step_probes(config, step, metrics, program):
+  """Writes one step's REQUIRED_RBF / MOE-DROPPED / NONFINITE lines (fetches the probes)."""
   if getattr(config, "log_nonfinite_probe", False) and "nonfinite_probe" in metrics:
     # The per-row counts are batch-sharded over every host: gather the global arrays (a collective; every process
     # reaches this call) instead of device_get, which refuses non-addressable arrays on a multi-host slice.

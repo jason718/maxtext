@@ -95,6 +95,39 @@ class DropProbeTest(unittest.TestCase):
     self.assertEqual(lines, ["REQUIRED_RBF step=3 max=1.2500 per_layer=[1.0000,1.2500]"])
 
 
+  def test_deferred_probe_lines(self):
+    """log_probes_deferred: step k's lines come after step k + 1 is dispatched; the last step's at once; same text."""
+
+    class Cfg:
+      log_moe_dropped_tokens = False
+      log_required_ragged_buffer_factor = True
+      log_nonfinite_probe = False
+      steps = 3
+
+    def run(deferred):
+      Cfg.log_probes_deferred = deferred
+      logged = []
+      orig = train.max_logging.log
+      train.max_logging.log = logged.append
+      try:
+        out = []
+        for step in range(3):
+          train._maybe_log_required_rbf(  # pylint: disable=protected-access
+              Cfg(), step, {"moe_required_rbf": np.array([1.0 + step, 2.0], np.float32)}, "normal"
+          )
+          out.append(list(logged))
+        return out
+      finally:
+        train.max_logging.log = orig
+
+    eager, deferred = run(False), run(True)
+    self.assertEqual(len(eager[0]), 1)
+    self.assertEqual(deferred[0], [])  # step 0 not fetched at its own dispatch
+    self.assertEqual(deferred[1], eager[0])  # written once step 1 is dispatched
+    self.assertEqual(deferred[2], eager[2])  # last step flushed at once
+    self.assertEqual(train._PENDING_STEP_PROBES, [])  # pylint: disable=protected-access
+
+
 class NonfiniteProbeTest(unittest.TestCase):
   """log_nonfinite_probe: per-row counts and the NONFINITE lines."""
 

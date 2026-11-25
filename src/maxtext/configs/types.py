@@ -4399,6 +4399,14 @@ class VisionTower(BaseModel):
           " <think>/</think> of the Olmo 3.5 SFT: [[100256, 14023, 771, 29], [100266, 524, 27963, 29]])."
       ),
   )
+  log_probes_deferred: bool = Field(
+      False,
+      description=(
+          "pre_train trainer: write a step's REQUIRED_RBF / MOE-DROPPED / NONFINITE lines after the next step is"
+          " dispatched (as LOSS-PARTS) instead of fetching the probes right after the dispatch, which blocks the host"
+          " until the step ends. Same lines and values; logging only."
+      ),
+  )
   log_loss_parts: bool = Field(
       False,
       description=(
