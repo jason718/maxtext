@@ -4306,6 +4306,14 @@ class VisionTower(BaseModel):
           "any device, as their output is zero anyway."
       ),
   )
+  olmo_vit_skip_empty_chunks: bool = Field(
+      False,
+      description=(
+          "OLMo 3.5 ViT, CP-sharded crop-chunk scan (olmo_vit_crop_chunk_size > 0): skip (lax.cond, zero features)"
+          " scan step i when no device holds a valid crop (< n_used of its row) in its chunk i. Same crop layout and"
+          " chunks; skipped chunks hold only padding crops, which contribute exact zeros to the gradients."
+      ),
+  )
   olmo_vit_balance_crops: bool = Field(
       False,
       description=(

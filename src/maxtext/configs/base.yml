@@ -1681,6 +1681,7 @@ olmo_vit_feature_layers: [24, 18]
 olmo_vit_remat_blocks: true
 olmo_vit_crop_chunk_size: 0
 olmo_vit_cp_shard_crops: true
+olmo_vit_skip_empty_chunks: false # CP crop-chunk scan: skip chunk steps with no valid crop on any device (same layout)
 olmo_vit_balance_crops: false # spread crops over all devices and skip chunks with no used crop
 olmo_vit_replicate_weights: false # ViT + connector kernels replicated (no per-layer weight all-gather)
 olmo_vit_outer_remat: true # jax.checkpoint the whole OLMo 3.5 vision tower + connector (with olmo_vit_remat_blocks, CP)

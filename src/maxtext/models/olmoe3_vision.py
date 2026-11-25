@@ -478,10 +478,21 @@ class OLMo35VisionEncoder(nnx.Module):
       return feats, {"layers": jnp.stack(layer_counts), "wused": jnp.stack(w_counts)}
     return feats
 
-  def _encode_crops_maybe_chunked(self, crops: jax.Array, *, cp_sharded: bool = False, probe: bool = False):
+  def _encode_crops_maybe_chunked(
+      self,
+      crops: jax.Array,
+      *,
+      cp_sharded: bool = False,
+      probe: bool = False,
+      crop_valid: jax.Array | None = None,
+  ):
     """Encodes ``[B, N_crops, P, D_in]`` while preserving batch (and optional CP) sharding across scan.
 
     ``probe``: also returns ``_encode_flat_crops``'s per-crop probes mapped back to ``[num_layers + 1, B, N_crops]``.
+    ``crop_valid`` ``[B, N_crops]`` (``olmo_vit_skip_empty_chunks``, CP-sharded chunked path): scan step ``i`` is
+    skipped (zero features, one ``lax.cond`` predicate for all devices) when no device holds a valid crop in its
+    chunk ``i``. Same layout and chunks as without it; a skipped chunk holds only padding crops, whose features are
+    selected away, so it contributed exact zeros to every gradient.
     """
     b_dim, n_crops, p, d_in = crops.shape
     chunk = int(self.config.olmo_vit_crop_chunk_size)
@@ -505,16 +516,45 @@ class OLMo35VisionEncoder(nnx.Module):
         chunked = jnp.transpose(reshaped, (2, 0, 1, 3, 4, 5))
         chunk_pspec = PartitionSpec(batch_axes, cp_axis, None, None, None)
 
-        def _scan_body_cp(carry, crop_chunk):
+        def _encode_chunk_cp(carry, crop_chunk):
           mod = nnx.merge(graphdef, carry)
           crop_chunk = sharding.maybe_shard_with_pspec(
               crop_chunk, chunk_pspec, self.mesh, self.config.shard_mode
           )
-          return carry, mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec, probe=probe)  # pylint: disable=protected-access
+          return mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec, probe=probe)  # pylint: disable=protected-access
+
+        if crop_valid is None:
+
+          def _scan_body_cp(carry, crop_chunk):
+            return carry, _encode_chunk_cp(carry, crop_chunk)
+
+          xs = chunked
+        else:
+          # [B, N_crops] -> any valid crop in chunk i of any (row, CP rank): [n_chunks].
+          chunk_any = jnp.any(crop_valid.reshape(b_dim, cp_size, n_chunks, chunk), axis=(0, 1, 3))
+          out_aval = jax.eval_shape(_encode_chunk_cp, state, jax.ShapeDtypeStruct(chunked.shape[1:], chunked.dtype))
+
+          feat_pspec = PartitionSpec(batch_axes, cp_axis, None, None, None)
+
+          def _skip_chunk_cp(carry, crop_chunk):
+            del carry, crop_chunk
+            feats_aval = out_aval[0] if probe else out_aval
+            feats = sharding.maybe_shard_with_pspec(
+                jnp.zeros(feats_aval.shape, feats_aval.dtype), feat_pspec, self.mesh, self.config.shard_mode
+            )
+            if probe:
+              return feats, jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), out_aval[1])
+            return feats
+
+          def _scan_body_cp(carry, xs_i):
+            crop_chunk, any_i = xs_i
+            return carry, jax.lax.cond(any_i, _encode_chunk_cp, _skip_chunk_cp, carry, crop_chunk)
+
+          xs = (chunked, chunk_any)
 
         chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
         scan_fn_cp = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body_cp) if chunk_remat else _scan_body_cp
-        _, out_chunks = jax.lax.scan(scan_fn_cp, state, chunked)
+        _, out_chunks = jax.lax.scan(scan_fn_cp, state, xs)
         if probe:
           out_chunks, pr = out_chunks
           # [n_chunks, L + 1, B, cp, chunk] -> [L + 1, B, cp, n_chunks, chunk]: crop = rank * per_rank + c * chunk + j.
@@ -754,7 +794,12 @@ class OLMo35VisionEncoder(nnx.Module):
       if bool(getattr(self.config, "olmo_vit_balance_crops", False)) and pooled_patches_idx is not None:
         out = self._encode_balanced(patches, pooled_patches_idx)
       if out is None:
-        out = self._encode_crops_maybe_chunked(patches, cp_sharded=True, probe=return_probes)
+        out = self._encode_crops_maybe_chunked(
+            patches,
+            cp_sharded=True,
+            probe=return_probes,
+            crop_valid=crop_valid if bool(getattr(self.config, "olmo_vit_skip_empty_chunks", False)) else None,
+        )
         if return_probes:
           out, pr = out
           _layer_probes(pr)
