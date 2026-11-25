@@ -4399,6 +4399,13 @@ class VisionTower(BaseModel):
           " <think>/</think> of the Olmo 3.5 SFT: [[100256, 14023, 771, 29], [100266, 524, 27963, 29]])."
       ),
   )
+  log_hbm_peak: bool = Field(
+      False,
+      description=(
+          "pre_train trainer (with log_loss_parts): an HBM-PEAK line on host 0 after steps 1, 5, 10 and the last"
+          " (max peak_bytes_in_use over the host's devices since start). Logging only."
+      ),
+  )
   log_probes_deferred: bool = Field(
       False,
       description=(

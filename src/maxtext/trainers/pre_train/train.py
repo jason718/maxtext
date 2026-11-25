@@ -1362,8 +1362,9 @@ def _maybe_log_loss_parts(config, step, metrics):
   """
   if not getattr(config, "log_loss_parts", False) or jax.process_index() != 0:
     return
+  _LOSS_PARTS_CONFIG["config"] = config
   keys = ("learning/lm_loss", "learning/z_loss", "learning/moe_lb_loss", "learning/total_weights", "learning/ce_text",
-          "learning/tokens_text", "learning/ce_img", "learning/tokens_img")
+          "learning/tokens_text", "learning/ce_img", "learning/tokens_img", "learning/raw_grad_norm")
   _PENDING_LOSS_PARTS.append((step, {k: metrics["scalar"][k] for k in keys if k in metrics.get("scalar", {})}))
   while len(_PENDING_LOSS_PARTS) > 1 or (_PENDING_LOSS_PARTS and step >= config.steps - 1):
     _log_loss_parts_line(*_PENDING_LOSS_PARTS.pop(0))
@@ -1382,7 +1383,28 @@ def _log_loss_parts_line(step, scalars):
         f" ce_text={float(vals['learning/ce_text']):.6f} tokens_text={float(vals['learning/tokens_text']):.0f}"
         f" ce_img={float(vals['learning/ce_img']):.6f} tokens_img={float(vals['learning/tokens_img']):.0f}"
     )
+  if "learning/raw_grad_norm" in vals:
+    # Pre-clip global gradient norm, full float32 precision (the step-by-step parity check reads it).
+    line += f" grad_norm={float(vals['learning/raw_grad_norm']):.9e}"
+  line += f" lm_full={lm:.9e}"
   max_logging.log(line)
+  cfg = _LOSS_PARTS_CONFIG.get("config")
+  if cfg is not None and getattr(cfg, "log_hbm_peak", False) and (step + 1 in (1, 5, 10) or step >= cfg.steps - 1):
+    _log_hbm_peak(step + 1)
+
+
+_LOSS_PARTS_CONFIG = {}
+
+
+def _log_hbm_peak(step):
+  """log_hbm_peak: one HBM-PEAK line (max over this host's devices of peak_bytes_in_use and bytes_limit)."""
+  peaks, limit = [], 0
+  for d in jax.local_devices():
+    stats = d.memory_stats() or {}
+    peaks.append(int(stats.get("peak_bytes_in_use", 0)))
+    limit = max(limit, int(stats.get("bytes_limit", 0)))
+  if peaks:
+    max_logging.log(f"HBM-PEAK step={step} peak_gib={max(peaks) / 2**30:.3f} limit_gib={limit / 2**30:.3f}")
 
 
 def required_rbf_log_lines(config, step, probe, suffix=""):
